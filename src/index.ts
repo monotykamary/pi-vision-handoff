@@ -5,6 +5,7 @@
  * convention pi-model-sort uses for picker-backed extensions.
  */
 
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -44,6 +45,18 @@ export const DEFAULT_CACHE_MAX = 50;
 /** Per-description request timeout. */
 export const DESCRIBE_TIMEOUT_MS = 30_000;
 
+/**
+ * Default cap on the number of lines kept from a description before truncation.
+ *
+ * Mirrors pi core's read-result truncation: tool output is bounded for both the
+ * TUI render and the model context. The stored `result.content` is the single
+ * source for both surfaces (no decouple point exists at `tool_result` — it's the
+ * only hook that still has the raw image before pi-ai strips it), so the cap
+ * applies uniformly. 0 = unbounded (default): the read tool's native collapse
+ * handles compactness and `ctrl+o` expands to the full description.
+ */
+export const DEFAULT_MAX_DESCRIPTION_LINES = 0;
+
 export interface VisionHandoffConfig {
   /** Master switch. When false, no handoff occurs even if a vision model is configured. */
   enabled: boolean;
@@ -57,6 +70,12 @@ export interface VisionHandoffConfig {
   maxTokens: number;
   /** Max images kept in the in-memory description cache. */
   cacheMax: number;
+  /**
+   * Max lines kept from a description before truncation (0 = unbounded).
+   * Bounds both the TUI render and the model context, like pi core's tool-output
+   * truncation.
+   */
+  maxDescriptionLines: number;
   /** Override the describer system prompt (defaults to DEFAULT_VISION_PROMPT). */
   prompt?: string;
   /** Override the user-prompt prefix (defaults to DEFAULT_USER_PROMPT_PREFIX). */
@@ -70,6 +89,7 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   handoffModels: [],
   maxTokens: DEFAULT_MAX_TOKENS,
   cacheMax: DEFAULT_CACHE_MAX,
+  maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
 };
 
 /** Parse a "provider/id" reference. Returns null if malformed. */
@@ -119,6 +139,14 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
   }
   if (typeof obj.cacheMax === "number" && Number.isFinite(obj.cacheMax) && obj.cacheMax > 0) {
     base.cacheMax = Math.floor(obj.cacheMax);
+  }
+  // maxDescriptionLines: any non-negative finite integer. 0 = unbounded.
+  if (
+    typeof obj.maxDescriptionLines === "number" &&
+    Number.isFinite(obj.maxDescriptionLines) &&
+    obj.maxDescriptionLines >= 0
+  ) {
+    base.maxDescriptionLines = Math.floor(obj.maxDescriptionLines);
   }
   if (typeof obj.prompt === "string" && obj.prompt.trim()) base.prompt = obj.prompt;
   if (typeof obj.userPromptPrefix === "string") base.userPromptPrefix = obj.userPromptPrefix;
@@ -181,8 +209,18 @@ export function extractImageFromBlock(block: unknown): ExtractedImage | null {
     return null;
   }
 
+  // anthropic-messages image block (wrapped in `source`).
   if (b.type === "image" && b.source?.type === "base64" && typeof b.source.data === "string") {
     return { data: b.source.data, mimeType: b.source.media_type || "image/png" };
+  }
+
+  // pi-ai internal image block — emitted by the `read` tool and carried by
+  // ToolResultEvent.content / user-message content blocks (regardless of whether
+  // the active model declares image input):
+  //   { type: "image", data: "<base64>", mimeType }
+  // Distinct from the anthropic shape above: no `source` wrapper, direct fields.
+  if (b.type === "image" && typeof b.data === "string") {
+    return { data: b.data, mimeType: b.mimeType || "image/png" };
   }
 
   return null;
@@ -195,4 +233,87 @@ export function makeReplacementText(block: unknown, description: string): Record
     return { type: "input_text", text: description };
   }
   return { type: "text", text: description };
+}
+
+/** Outcome of {@link truncateDescription}. */
+export interface TruncatedDescription {
+  text: string;
+  /** True iff lines were dropped. */
+  truncated: boolean;
+  /** Number of trailing lines removed. */
+  hidden: number;
+}
+
+/**
+ * Head-truncate a description to its first `maxLines` lines with a
+ * "... (N more lines)" footer, mirroring pi core's read-result truncation
+ * notice (which itself surfaces "... (N more lines, ctrl+o to expand)").
+ *
+ * Returns the text unchanged when it is at or below the limit, or when
+ * `maxLines` is non-positive (0 = unbounded). Head-truncation keeps the leading
+ * layout / text-content / structure sections, which are typically the most
+ * actionable for a coding agent.
+ */
+export function truncateDescription(text: string, maxLines: number): TruncatedDescription {
+  if (!maxLines || maxLines <= 0) {
+    return { text, truncated: false, hidden: 0 };
+  }
+  const lines = text.split("\n");
+  if (lines.length <= maxLines) {
+    return { text, truncated: false, hidden: 0 };
+  }
+  const hidden = lines.length - maxLines;
+  const kept = lines.slice(0, maxLines).join("\n");
+  return { text: `${kept}\n... (${hidden} more lines)`, truncated: true, hidden };
+}
+
+/** Outcome of {@link insertImageDescriptions}. */
+export interface ReplacedContent {
+  content: (TextContent | ImageContent)[];
+  /** True iff at least one image block had a description inserted before it. */
+  changed: boolean;
+}
+
+/**
+ * Insert a description text block before each image block in a tool-result /
+ * message content array, KEEPING the image block in place.
+ *
+ * Why insert (not replace): the stored tool-result content is the single
+ * source for both the TUI render (kitty inline images read it via
+ * `result.content.filter(c => c.type === "image")`) and the provider payload.
+ * Replacing the image would strip it from the terminal render. Keeping the
+ * image preserves kitty rendering; the inserted description still reaches
+ * non-vision models because pi-ai's `downgradeUnsupportedImages` only rewrites
+ * `type: "image"` blocks for non-vision models — text blocks (including this
+ * description) pass through untouched to the provider.
+ *
+ * `describe` is injected (rather than calling the vision model directly) so the
+ * extract → describe → insert pipeline is unit-testable without standing up a
+ * provider, registry, and API call. The extension wires its real `describeImage`
+ * into this helper in its `tool_result` handler.
+ *
+ * Returns a new array and `changed: false` when there were no images, so
+ * callers can short-circuit and avoid mutating pi's stored result unnecessarily.
+ */
+export async function insertImageDescriptions(
+  content: readonly (TextContent | ImageContent)[] | undefined,
+  describe: (img: ExtractedImage) => Promise<string>,
+): Promise<ReplacedContent> {
+  if (!Array.isArray(content)) {
+    return { content: [], changed: false };
+  }
+  const next: (TextContent | ImageContent)[] = [];
+  let changed = false;
+  for (const block of content) {
+    const img = extractImageFromBlock(block);
+    if (!img) {
+      next.push(block);
+      continue;
+    }
+    const description = await describe(img);
+    next.push({ type: "text", text: description } satisfies TextContent);
+    next.push(block);
+    changed = true;
+  }
+  return { content: next, changed };
 }

@@ -8,15 +8,18 @@ import {
   extractImageFromBlock,
   formatModelRef,
   getConfigPath,
+  insertImageDescriptions,
   isVisionModel,
   makeReplacementText,
   normalizeConfig,
   parseDataUrl,
   parseModelRef,
   readConfig,
+  truncateDescription,
   writeConfig,
   type VisionHandoffConfig,
 } from "../../src/index.js";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 
 describe("parseModelRef / formatModelRef", () => {
   it("parses provider/id", () => {
@@ -78,12 +81,14 @@ describe("normalizeConfig", () => {
       handoffModels: ["ollama/llava", "bad-ref", "deepseek/deepseek-chat"],
       maxTokens: 2048,
       cacheMax: 5,
+      maxDescriptionLines: 12,
     });
     expect(cfg.enabled).toBe(false);
     expect(cfg.visionModel).toBe("openai/gpt-4o");
     expect(cfg.handoffModels).toEqual(["ollama/llava", "deepseek/deepseek-chat"]);
     expect(cfg.maxTokens).toBe(2048);
     expect(cfg.cacheMax).toBe(5);
+    expect(cfg.maxDescriptionLines).toBe(12);
   });
 
   it("drops an invalid visionModel ref", () => {
@@ -99,6 +104,20 @@ describe("normalizeConfig", () => {
     const cfg = normalizeConfig({ maxTokens: -10, cacheMax: "big" });
     expect(cfg.maxTokens).toBe(DEFAULT_CONFIG.maxTokens);
     expect(cfg.cacheMax).toBe(DEFAULT_CONFIG.cacheMax);
+  });
+
+  it("accepts maxDescriptionLines, including 0 (unbounded)", () => {
+    expect(normalizeConfig({ maxDescriptionLines: 0 }).maxDescriptionLines).toBe(0);
+    expect(normalizeConfig({ maxDescriptionLines: 7 }).maxDescriptionLines).toBe(7);
+  });
+
+  it("rejects negative / non-finite maxDescriptionLines", () => {
+    expect(normalizeConfig({ maxDescriptionLines: -3 }).maxDescriptionLines).toBe(
+      DEFAULT_CONFIG.maxDescriptionLines,
+    );
+    expect(normalizeConfig({ maxDescriptionLines: "lots" }).maxDescriptionLines).toBe(
+      DEFAULT_CONFIG.maxDescriptionLines,
+    );
   });
 
   it("accepts prompt and userPromptPrefix overrides", () => {
@@ -136,6 +155,29 @@ describe("image block extraction across request formats", () => {
     expect(extractImageFromBlock(block)).toEqual({ mimeType: "image/png", data: base64 });
   });
 
+  it("parses pi-ai internal image blocks (read tool / ToolResultEvent shape)", () => {
+    const block = { type: "image", data: base64, mimeType: "image/png" };
+    expect(extractImageFromBlock(block)).toEqual({ mimeType: "image/png", data: base64 });
+  });
+
+  it("defaults mimeType to image/png for internal blocks when missing", () => {
+    const block = { type: "image", data: base64 };
+    expect(extractImageFromBlock(block)).toEqual({ mimeType: "image/png", data: base64 });
+  });
+
+  it("prefers the anthropic `source` shape over the internal one when both are present", () => {
+    const block = {
+      type: "image",
+      source: { type: "base64", media_type: "image/gif", data: base64 },
+    };
+    expect(extractImageFromBlock(block)).toEqual({ mimeType: "image/gif", data: base64 });
+  });
+
+  it("returns null for an image block with non-string data", () => {
+    expect(extractImageFromBlock({ type: "image", data: 123 })).toBeNull();
+    expect(extractImageFromBlock({ type: "image", mimeType: "image/png" })).toBeNull();
+  });
+
   it("returns null for non-image blocks and junk", () => {
     expect(extractImageFromBlock({ type: "text", text: "hi" })).toBeNull();
     expect(extractImageFromBlock(null)).toBeNull();
@@ -171,6 +213,11 @@ describe("makeReplacementText", () => {
 
   it("emits text for anthropic blocks", () => {
     const block = { type: "image", source: { type: "base64", data: "ABC" } };
+    expect(makeReplacementText(block, "[Image: desc]")).toEqual({ type: "text", text: "[Image: desc]" });
+  });
+
+  it("emits text for pi-ai internal image blocks", () => {
+    const block = { type: "image", data: "ABC", mimeType: "image/png" };
     expect(makeReplacementText(block, "[Image: desc]")).toEqual({ type: "text", text: "[Image: desc]" });
   });
 });
@@ -227,5 +274,114 @@ describe("config round-trip via PI_CODING_AGENT_DIR", () => {
 
   it("getConfigPath points at extensions/pi-vision-handoff.json", () => {
     expect(getConfigPath()).toBe(join(tmpHome, "extensions", "pi-vision-handoff.json"));
+  });
+});
+
+describe("insertImageDescriptions", () => {
+  const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+  const textBlock = { type: "text", text: "hello" } as const;
+
+  it("inserts a description text block before each image, keeping the image", async () => {
+    const describe = async (img: { mimeType: string }) => `[Image: ${img.mimeType}]`;
+    const result = await insertImageDescriptions(
+      [textBlock, { type: "image", data: base64, mimeType: "image/png" }],
+      describe,
+    );
+    expect(result.changed).toBe(true);
+    expect(result.content).toEqual([
+      { type: "text", text: "hello" },
+      { type: "text", text: "[Image: image/png]" },
+      { type: "image", data: base64, mimeType: "image/png" },
+    ]);
+  });
+
+  it("reports changed=false and leaves content unchanged when there are no images", async () => {
+    const result = await insertImageDescriptions([textBlock], async () => "never called");
+    expect(result.changed).toBe(false);
+    expect(result.content).toEqual([textBlock]);
+  });
+
+  it("handles empty content", async () => {
+    const result = await insertImageDescriptions([], async () => "x");
+    expect(result.changed).toBe(false);
+    expect(result.content).toEqual([]);
+  });
+
+  it("handles undefined / non-array content defensively", async () => {
+    const result = await insertImageDescriptions(undefined, async () => "x");
+    expect(result.changed).toBe(false);
+    expect(result.content).toEqual([]);
+  });
+
+  it("inserts a description before every image block across formats, keeping each image", async () => {
+    const describe = async (img: { data: string }) => `desc(${img.data})`;
+    const input: unknown = [
+      { type: "image", data: "AAA", mimeType: "image/png" },
+      textBlock,
+      { type: "image", source: { type: "base64", media_type: "image/gif", data: "BBB" } },
+      { type: "image_url", image_url: { url: "data:image/jpeg;base64,CCC" } },
+    ];
+    const result = await insertImageDescriptions(
+      input as (TextContent | ImageContent)[],
+      describe,
+    );
+    expect(result.changed).toBe(true);
+    expect(result.content).toEqual([
+      { type: "text", text: "desc(AAA)" },
+      { type: "image", data: "AAA", mimeType: "image/png" },
+      { type: "text", text: "hello" },
+      { type: "text", text: "desc(BBB)" },
+      { type: "image", source: { type: "base64", media_type: "image/gif", data: "BBB" } },
+      { type: "text", text: "desc(CCC)" },
+      { type: "image_url", image_url: { url: "data:image/jpeg;base64,CCC" } },
+    ]);
+  });
+
+  it("keeps the original image block by reference (for TUI kitty rendering)", async () => {
+    const image: ImageContent = { type: "image", data: base64, mimeType: "image/png" };
+    const result = await insertImageDescriptions([image], async () => "d");
+    expect(result.content[1]).toBe(image);
+  });
+
+  it("does not mutate the input array", async () => {
+    const inputImage: ImageContent = { type: "image", data: base64, mimeType: "image/png" };
+    const input: (TextContent | ImageContent)[] = [textBlock, inputImage];
+    await insertImageDescriptions(input, async () => "d");
+    expect(input).toEqual([textBlock, inputImage]);
+    expect(input).toHaveLength(2);
+  });
+});
+
+describe("truncateDescription", () => {
+  it("returns the text unchanged when at or below the limit", () => {
+    const text = "line1\nline2\nline3";
+    expect(truncateDescription(text, 5)).toEqual({ text, truncated: false, hidden: 0 });
+    expect(truncateDescription(text, 3)).toEqual({ text, truncated: false, hidden: 0 });
+  });
+
+  it("head-truncates and reports the hidden count", () => {
+    const text = "a\nb\nc\nd\ne";
+    const result = truncateDescription(text, 2);
+    expect(result.truncated).toBe(true);
+    expect(result.hidden).toBe(3);
+    expect(result.text).toBe("a\nb\n... (3 more lines)");
+  });
+
+  it("treats 0 and negative limits as unbounded", () => {
+    const text = "a\nb\nc";
+    expect(truncateDescription(text, 0)).toEqual({ text, truncated: false, hidden: 0 });
+    expect(truncateDescription(text, -5)).toEqual({ text, truncated: false, hidden: 0 });
+  });
+
+  it("handles single-line text at limit 1 without truncating", () => {
+    const text = "only line";
+    expect(truncateDescription(text, 1)).toEqual({ text, truncated: false, hidden: 0 });
+  });
+
+  it("truncates to a single line and counts the rest as hidden", () => {
+    const result = truncateDescription("a\nb\nc\nd", 1);
+    expect(result.text).toBe("a\n... (3 more lines)");
+    expect(result.hidden).toBe(3);
+    expect(result.truncated).toBe(true);
   });
 });

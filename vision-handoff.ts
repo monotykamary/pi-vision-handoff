@@ -9,12 +9,18 @@
  *
  * Pipeline (provider-agnostic via @earendil-works/pi-ai's complete()):
  *   before_agent_start → warm the description cache for attached images
- *   before_provider_request → swap image blocks in the payload for text
+ *   tool_result (read) → describe read-tool images and INSERT the description
+ *     as a text block before each image, keeping the image so the TUI still
+ *     renders it (kitty). pi-ai later strips the image for non-vision models,
+ *     leaving the description text for the model.
+ *   before_provider_request → swap remaining image blocks in the payload for
+ *     text (catches user-attached images for vision-capable handoff targets)
  *
- * Image blocks are detected by shape across the three request formats pi uses:
+ * Image blocks are detected by shape across the four formats pi uses:
  *   openai-completions: { type: "image_url",  image_url: { url: "data:..." } }
  *   openai-responses:   { type: "input_image", image_url: "data:..." }
  *   anthropic-messages: { type: "image", source: { type: "base64", media_type, data } }
+ *   pi-ai internal:     { type: "image", data, mimeType }   ← read tool / ToolResultEvent
  *
  * Descriptions are cached per image hash (LRU, size = config.cacheMax) so the
  * swap is instant by the time before_provider_request fires.
@@ -33,10 +39,12 @@ import {
   IMAGE_PLACEHOLDER_SUFFIX,
   extractImageFromBlock,
   formatModelRef,
+  insertImageDescriptions,
   isVisionModel,
   makeReplacementText,
   parseModelRef,
   readConfig,
+  truncateDescription,
   writeConfig,
   type VisionHandoffConfig,
 } from "./src/index.js";
@@ -45,6 +53,9 @@ import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./
 const UNAVAILABLE = `${IMAGE_PLACEHOLDER_PREFIX}description unavailable${IMAGE_PLACEHOLDER_SUFFIX}`;
 
 let config: VisionHandoffConfig = readConfig();
+
+/** User prompt for the current agent turn, captured from before_agent_start. */
+let pendingTurnPrompt: string | null = null;
 
 const visionCache = new Map<string, Promise<string>>();
 let visionModelCache: { ref: string; model: Model<Api> } | null = null;
@@ -134,7 +145,17 @@ async function describeImage(
         .join("\n")
         .trim();
       if (!description) return UNAVAILABLE;
-      return `${IMAGE_PLACEHOLDER_PREFIX}${description}${IMAGE_PLACEHOLDER_SUFFIX}`;
+      // The full description lives in the stored tool-result content; the read
+      // tool's native collapse (ctrl+o) handles compactness — collapsed shows
+      // the image only, expanded shows the full description + image. Only apply
+      // a hard line cap when the user opts in (maxDescriptionLines > 0); by
+      // default (0) the description is unbounded so ctrl+o can expand to all
+      // of it and the model receives the complete context.
+      const { text: final } =
+        cfg.maxDescriptionLines && cfg.maxDescriptionLines > 0
+          ? truncateDescription(description, cfg.maxDescriptionLines)
+          : { text: description };
+      return `${IMAGE_PLACEHOLDER_PREFIX}${final}${IMAGE_PLACEHOLDER_SUFFIX}`;
     } catch {
       return UNAVAILABLE;
     } finally {
@@ -196,11 +217,17 @@ export default function (pi: ExtensionAPI) {
     // Reload in case the user edited the config on disk from another session.
     config = readConfig();
     visionModelCache = null;
+    pendingTurnPrompt = null;
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
+
+    // Capture this turn's user prompt so read-tool images are described in
+    // the same context. Fires before any tool_result for the turn.
+    pendingTurnPrompt = event.prompt || "";
+
     const images = event.images;
     if (!images || images.length === 0) return;
 
@@ -233,6 +260,29 @@ export default function (pi: ExtensionAPI) {
     const payload = event.payload as Record<string, unknown>;
     await replaceImagesWithDescriptions(payload, "", visionModel, ctx.modelRegistry, config);
     return payload;
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    if (!isConfigured(config)) return;
+    if (!isHandoffTarget(ctx.model, config)) return;
+    if (event.toolName !== "read") return;
+
+    const content = event.content;
+    if (!Array.isArray(content)) return;
+    // Skip the async work entirely when there is nothing to describe.
+    if (!content.some((c) => extractImageFromBlock(c))) return;
+
+    const visionModel = resolveVisionModel(ctx.modelRegistry, config.visionModel!);
+    if (!visionModel) {
+      notifyUnresolvedVisionModel(ctx, config.visionModel!);
+      return;
+    }
+
+    const { content: next, changed } = await insertImageDescriptions(content, (img) =>
+      describeImage(img.data, img.mimeType, pendingTurnPrompt ?? "", visionModel, ctx.modelRegistry, config),
+    );
+    if (!changed) return;
+    return { content: next };
   });
 
   pi.on("model_select", (event, ctx) => {
@@ -464,7 +514,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
   lines.push(`Vision model: ${config.visionModel ?? "(none — pick one with /vision-handoff)"}`);
   lines.push(`Auto handoff (non-vision models): ${config.autoHandoff ? "on" : "off"}`);
   lines.push(`Handoff targets (explicit): ${config.handoffModels.length ? config.handoffModels.join(", ") : "(none)"}`);
-  lines.push(`maxTokens: ${config.maxTokens} · cacheMax: ${config.cacheMax}`);
+  lines.push(`maxTokens: ${config.maxTokens} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
 
   const model = ctx.model;
   let active = false;
