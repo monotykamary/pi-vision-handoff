@@ -57,6 +57,29 @@ export const DESCRIBE_TIMEOUT_MS = 30_000;
  */
 export const DEFAULT_MAX_DESCRIPTION_LINES = 0;
 
+/**
+ * The note pi core's `read` tool appends to image-result text blocks when the
+ * active model lacks image input (see `getNonVisionImageNote` in pi core).
+ *
+ * Once this extension inserts a description, the note becomes self-
+ * contradicting ("image will be omitted" vs. the vivid description that
+ * follows) and confuses the model. {@link stripNonVisionImageNote} removes it.
+ */
+export const NON_VISION_IMAGE_NOTE =
+  "[Current model does not support images. The image will be omitted from this request.]";
+
+/**
+ * Remove {@link NON_VISION_IMAGE_NOTE} from a text block.
+ *
+ * The read tool appends the note as `\n${NOTE}` (always the trailing segment of
+ * the metadata text block), so this also collapses the orphaned newline it
+ * leaves behind. Safe to call on text that does not contain the note (no-op).
+ */
+export function stripNonVisionImageNote(text: string): string {
+  if (!text.includes(NON_VISION_IMAGE_NOTE)) return text;
+  return text.split(NON_VISION_IMAGE_NOTE).join("").replace(/\n+$/, "");
+}
+
 export interface VisionHandoffConfig {
   /** Master switch. When false, no handoff occurs even if a vision model is configured. */
   enabled: boolean;
@@ -292,6 +315,12 @@ export interface ReplacedContent {
  * provider, registry, and API call. The extension wires its real `describeImage`
  * into this helper in its `tool_result` handler.
  *
+ * When at least one description is inserted, also strips pi core's
+ * {@link NON_VISION_IMAGE_NOTE} from text blocks — the note (appended by the
+ * read tool for non-vision models) would otherwise contradict the inserted
+ * description. Text blocks are reassigned (not mutated in place); the input
+ * array is left untouched.
+ *
  * Returns a new array and `changed: false` when there were no images, so
  * callers can short-circuit and avoid mutating pi's stored result unnecessarily.
  */
@@ -314,6 +343,19 @@ export async function insertImageDescriptions(
     next.push({ type: "text", text: description } satisfies TextContent);
     next.push(block);
     changed = true;
+  }
+  if (!changed) {
+    return { content: next, changed };
+  }
+  // We inserted at least one description. Strip the read tool's
+  // "[Current model does not support images...]" note from text blocks — it
+  // contradicts the description we just inserted ("image will be omitted" vs.
+  // the description that follows) and confuses the model.
+  for (let i = 0; i < next.length; i++) {
+    const block = next[i];
+    if (block.type === "text" && typeof block.text === "string" && block.text.includes(NON_VISION_IMAGE_NOTE)) {
+      next[i] = { type: "text", text: stripNonVisionImageNote(block.text) } satisfies TextContent;
+    }
   }
   return { content: next, changed };
 }

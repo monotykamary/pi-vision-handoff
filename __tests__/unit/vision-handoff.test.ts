@@ -11,10 +11,12 @@ import {
   insertImageDescriptions,
   isVisionModel,
   makeReplacementText,
+  NON_VISION_IMAGE_NOTE,
   normalizeConfig,
   parseDataUrl,
   parseModelRef,
   readConfig,
+  stripNonVisionImageNote,
   truncateDescription,
   writeConfig,
   type VisionHandoffConfig,
@@ -343,6 +345,32 @@ describe("insertImageDescriptions", () => {
     expect(result.content[1]).toBe(image);
   });
 
+  it("strips pi core's non-vision image note from text blocks when inserting a description", async () => {
+    const metadata: TextContent = {
+      type: "text",
+      text: `Read image file [image/png]\n[Image: original 2356x964]\n${NON_VISION_IMAGE_NOTE}`,
+    };
+    const image: ImageContent = { type: "image", data: base64, mimeType: "image/png" };
+    const result = await insertImageDescriptions([metadata, image], async () => "a vivid description");
+    expect(result.changed).toBe(true);
+    // Metadata text block no longer carries the contradictory note...
+    expect(result.content[0]).toEqual({
+      type: "text",
+      text: "Read image file [image/png]\n[Image: original 2356x964]",
+    });
+    // ...the inserted description follows...
+    expect(result.content[1]).toEqual({ type: "text", text: "a vivid description" });
+    // ...and the image is kept.
+    expect(result.content[2]).toBe(image);
+  });
+
+  it("leaves text blocks untouched when there are no images to describe", async () => {
+    const metadata: TextContent = { type: "text", text: `note?\n${NON_VISION_IMAGE_NOTE}` };
+    const result = await insertImageDescriptions([metadata], async () => "never called");
+    expect(result.changed).toBe(false);
+    expect(result.content[0]).toBe(metadata);
+  });
+
   it("does not mutate the input array", async () => {
     const inputImage: ImageContent = { type: "image", data: base64, mimeType: "image/png" };
     const input: (TextContent | ImageContent)[] = [textBlock, inputImage];
@@ -383,5 +411,33 @@ describe("truncateDescription", () => {
     expect(result.text).toBe("a\n... (3 more lines)");
     expect(result.hidden).toBe(3);
     expect(result.truncated).toBe(true);
+  });
+});
+
+describe("stripNonVisionImageNote", () => {
+  it("removes the note and the orphaned newline before it", () => {
+    const text = `Read image file [image/png]\n[Image: original 2356x964]\n${NON_VISION_IMAGE_NOTE}`;
+    expect(stripNonVisionImageNote(text)).toBe("Read image file [image/png]\n[Image: original 2356x964]");
+  });
+
+  it("returns text unchanged when the note is absent", () => {
+    expect(stripNonVisionImageNote("just text")).toBe("just text");
+    expect(stripNonVisionImageNote("")).toBe("");
+  });
+
+  it("does not match a partial / truncated note", () => {
+    const partial = "[Current model does not support images]";
+    expect(stripNonVisionImageNote(`prefix\n${partial}`)).toBe(`prefix\n${partial}`);
+  });
+
+  it("removes the note even when it is the only content", () => {
+    expect(stripNonVisionImageNote(NON_VISION_IMAGE_NOTE)).toBe("");
+  });
+
+  it("does not mutate the input string (strings are immutable; returns a new value)", () => {
+    const original = `prefix\n${NON_VISION_IMAGE_NOTE}`;
+    const stripped = stripNonVisionImageNote(original);
+    expect(stripped).toBe("prefix");
+    expect(original).toBe(`prefix\n${NON_VISION_IMAGE_NOTE}`);
   });
 });
