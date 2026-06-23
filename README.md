@@ -1,0 +1,206 @@
+<div align="center">
+
+# 👁️ pi-vision-handoff
+
+**Give text-only [pi](https://github.com/earendil-works/pi-coding-agent) models vision**
+
+_Describe images with a vision model you pick, then feed the text to models that can't see._
+
+[![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
+[![npm](https://img.shields.io/npm/v/pi-vision-handoff)](https://www.npmjs.com/package/pi-vision-handoff)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
+</div>
+
+---
+
+## The Problem
+
+Some of the best coding models are blind. You paste a screenshot, a UI mock, a stack trace, or a diagram into pi — and a text-only model either silently ignores the image or rejects the request outright. Up to now your only options were to describe the image yourself, or switch to a (often weaker-for-coding) vision model just to read it.
+
+The `pi-umans-provider` extension quietly solved this for GLM 5.1: a hardcoded "vision handoff" pipeline that had `umans-flash` describe each image at prompt time and swapped the text in for the image block before the request left. It worked great — but it was welded to one provider, one describer, and one set of models.
+
+## The Solution
+
+`pi-vision-handoff` extracts that pipeline and makes it **provider-agnostic**:
+
+- **Pick any vision-capable model** from your registry via an interactive picker — OpenAI, Anthropic, Google, Ollama, or any custom provider pi knows about.
+- Your choice **persists** to `~/.pi/agent/extensions/pi-vision-handoff.json`.
+- For any model that doesn't declare image input (or any model you explicitly target), `pi-vision-handoff` describes the image with your chosen vision model **before** the request is sent, then **swaps the image block for the description** in the actual provider payload.
+- Works across all three request formats pi uses — OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages — detected by block shape.
+- Descriptions are **cached per image hash** (LRU), so the swap is instant by the time the request fires.
+
+No `settings.json` touched. No per-provider glue. Pick a describer once and every text-only model you own can suddenly see.
+
+## Features
+
+- **🎮 Interactive picker** — `/vision-handoff` opens a TUI listing every model, vision-capable ones first (👁), to choose your describer.
+- **🔌 Provider-agnostic** — uses pi's own model execution machinery (`@earendil-works/pi-ai`'s `complete()`), so it works with any provider/configured model, including custom provider extensions.
+- **🧠 Automatic targets** — by default, handoff applies to *every* model that lacks native vision. Opt out with `/vision-handoff auto off`.
+- **🗂️ Explicit overrides** — force handoff for specific models (e.g. a weak vision model) with `/vision-handoff add`.
+- **⚡ Cache-warmed** — `before_agent_start` describes attached images the moment you submit, so the request is rarely delayed.
+- **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
+- **🔧 Tunable** — cap description length and cache size in the config file.
+
+## Usage
+
+### Interactive Commands
+
+| Command | What it does |
+|---------|-------------|
+| `/vision-handoff` | Open the interactive picker to choose the vision model |
+| `/vision-handoff select` | Same as `/vision-handoff` |
+| `/vision-handoff model openai/gpt-4o` | Set the vision model directly |
+| `/vision-handoff status` | Show current config + whether handoff is active for the current model |
+| `/vision-handoff enable` / `disable` | Master switch (keeps your configured model) |
+| `/vision-handoff auto on` / `off` | Toggle automatic handoff for all non-vision models |
+| `/vision-handoff add ollama/llava:13b` | Force handoff for an extra model |
+| `/vision-handoff remove ollama/llava:13b` | Stop forcing handoff for a model |
+| `/vision-handoff clear` | Clear the configured vision model |
+| `/vision-handoff help` | Show usage reference |
+
+### Config File
+
+Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on first change:
+
+```json
+{
+  "enabled": true,
+  "visionModel": "openai/gpt-4o",
+  "autoHandoff": true,
+  "handoffModels": ["ollama/llava:13b"],
+  "maxTokens": 1024,
+  "cacheMax": 50,
+  "prompt": "Describe this image exhaustively…",
+  "userPromptPrefix": "The user's request about this image: "
+}
+```
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `enabled` | `true` | Master switch. When `false`, no handoff occurs. |
+| `visionModel` | `null` | The describer, as `provider/id`. `null` = not configured (handoff inactive). |
+| `autoHandoff` | `true` | Apply handoff to every model whose `input` does not include `image`. |
+| `handoffModels` | `[]` | Extra `provider/id` refs that should also receive handoff. |
+| `maxTokens` | `1024` | Cap on a single description's output. |
+| `cacheMax` | `50` | Max described images kept in the in-memory cache per session. |
+| `prompt` | _(built-in)_ | Override the describer system prompt. |
+| `userPromptPrefix` | _(built-in)_ | Override the prefix prepended to your original prompt. |
+
+> The config path uses pi's `getAgentDir()` — set `PI_CODING_AGENT_DIR` to relocate it.
+
+## Installation
+
+**With `pi install`** (recommended):
+
+```bash
+pi install npm:pi-vision-handoff
+```
+
+Or install from GitHub:
+
+```bash
+pi install https://github.com/monotykamary/pi-vision-handoff
+```
+
+**With npm**:
+
+```bash
+npm install pi-vision-handoff
+```
+
+Or in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "packages": [
+    "npm:pi-vision-handoff"
+  ]
+}
+```
+
+Then `/reload` or restart pi.
+
+For a quick one-off test:
+
+```bash
+pi -e ./vision-handoff.ts
+```
+
+## How It Works
+
+```
+You submit a prompt + image, on a text-only model
+  → before_agent_start
+      • is this model a handoff target? (non-vision, or in handoffModels)
+      • for each attached image → describeImage() with your chosen vision model
+          - complete() via pi-ai (resolves API key/headers/baseUrl for you)
+          - cached by sha256(mime + base64)
+      • fire-and-forget — warms the cache
+  → before_provider_request
+      • walk the provider payload's messages[]
+      • for every image block (detected by shape) → swap for a text block:
+          "[Image: <cached description>]"
+      • returns the modified payload to pi
+
+Result: the text-only model receives a vivid text description in place of
+the image, and your turn proceeds normally.
+```
+
+### Image-block formats handled
+
+| API | Image block shape | Replacement |
+|-----|-------------------|-------------|
+| OpenAI Chat Completions | `{ type: "image_url", image_url: { url: "data:…" } }` | `{ type: "text", text }` |
+| OpenAI Responses | `{ type: "input_image", image_url: "data:…" }` | `{ type: "input_text", text }` |
+| Anthropic Messages | `{ type: "image", source: { type: "base64", media_type, data } }` | `{ type: "text", text }` |
+
+The describer call itself goes through pi's normal model machinery (`complete()`), **not** the agent event loop — so it never re-triggers `before_provider_request` (no recursion).
+
+## Comparison with Alternatives
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **pi-vision-handoff** (this) | Provider-agnostic; pick any describer; automatic for text-only models; cached; survives across providers | Adds one extra model call per unique image |
+| Native vision on every model | Zero overhead | Not all models support it; you may be forced off your preferred coding model |
+| Manually describing images | No extension | Tedious; lossy; kills the "paste a screenshot" workflow |
+| The original `pi-umans-provider` handoff | Battle-tested | Hardcoded to `umans-flash` + UMANS models only |
+| Switching to a vision model to read an image, then back | Works | Context loss across model swaps; worse coding model for the actual work |
+
+## Development
+
+```bash
+pnpm install
+pnpm test          # Vitest unit tests (31 passing)
+pnpm typecheck     # TypeScript validation
+pnpm lint:dead     # Dead code detection (knip)
+```
+
+### Structure
+
+```
+.
+├── vision-handoff.ts            # Main extension: hooks, command, describer
+├── src/
+│   ├── index.ts                  # Config schema, read/write, image-block helpers
+│   └── vision-model-selector.ts  # Interactive picker TUI component
+├── __tests__/unit/
+│   ├── config-dir.test.ts        # Ensures getAgentDir() usage
+│   └── vision-handoff.test.ts    # Config, refs, image-block extraction, round-trip
+├── package.json
+├── tsconfig.json
+├── knip.json
+└── vitest.config.ts
+```
+
+## Acknowledgements
+
+The vision handoff concept and the exhaustive describer prompt originate from
+the [pi-umans-provider](https://github.com/monotykamary/pi-umans-provider) GLM 5.1
+pipeline. The picker TUI builds on the patterns from
+[pi-hide-providers](https://github.com/monotykamary/pi-hide-providers), which in
+turn mirror pi core's built-in selectors.
+
+## License
+
+MIT
