@@ -26,8 +26,8 @@ The `pi-umans-provider` extension quietly solved this for GLM 5.1: a hardcoded "
 
 - **Pick any vision-capable model** from your registry via an interactive picker — OpenAI, Anthropic, Google, Ollama, or any custom provider pi knows about.
 - Your choice **persists** to `~/.pi/agent/extensions/pi-vision-handoff.json`.
-- For any model that doesn't declare image input (or any model you explicitly target), `pi-vision-handoff` describes the image with your chosen vision model **before** the request is sent, then **swaps the image block for the description** in the actual provider payload.
-- Works across all three request formats pi uses — OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages — detected by block shape.
+- For any model that doesn't declare image input (or any model you explicitly target), `pi-vision-handoff` describes the image with your chosen vision model and **inserts the description before the kept image** in the stored `read`-tool result — **before** pi-ai can strip the image for non-vision models. The image stays for kitty rendering; pi-ai later strips only the image block, leaving the description text for the model.
+- Works across all four image-block shapes pi uses — the three provider-transformed formats (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages) plus pi-ai's internal `{ type: "image", data, mimeType }` emitted by the `read` tool — detected by shape.
 - Descriptions are **cached per image hash** (LRU), so the swap is instant by the time the request fires.
 
 No `settings.json` touched. No per-provider glue. Pick a describer once and every text-only model you own can suddenly see.
@@ -35,12 +35,13 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 ## Features
 
 - **🎮 Interactive picker** — `/vision-handoff` opens a TUI listing every model, vision-capable ones first (👁), to choose your describer.
+- **🖼️ Read-tool hijack** — `read`-tool images are intercepted at `tool_result` time, before pi-ai can strip them for non-vision models. The kept image still renders inline (kitty); the description is inserted as a text block the text-only model consumes.
 - **🔌 Provider-agnostic** — uses pi's own model execution machinery (`@earendil-works/pi-ai`'s `complete()`), so it works with any provider/configured model, including custom provider extensions.
 - **🧠 Automatic targets** — by default, handoff applies to *every* model that lacks native vision. Opt out with `/vision-handoff auto off`.
 - **🗂️ Explicit overrides** — force handoff for specific models (e.g. a weak vision model) with `/vision-handoff add`.
 - **⚡ Cache-warmed** — `before_agent_start` describes attached images the moment you submit, so the request is rarely delayed.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
-- **🔧 Tunable** — cap description length and cache size in the config file.
+- **🔧 Tunable** — cap description length (`maxDescriptionLines`; unbounded by default, so `read`'s native `ctrl+o` collapse handles compactness) and cache size, in the config file.
 
 ## Usage
 
@@ -71,6 +72,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
   "handoffModels": ["ollama/llava:13b"],
   "maxTokens": 1024,
   "cacheMax": 50,
+  "maxDescriptionLines": 0,
   "prompt": "Describe this image exhaustively…",
   "userPromptPrefix": "The user's request about this image: "
 }
@@ -84,6 +86,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `handoffModels` | `[]` | Extra `provider/id` refs that should also receive handoff. |
 | `maxTokens` | `1024` | Cap on a single description's output. |
 | `cacheMax` | `50` | Max described images kept in the in-memory cache per session. |
+| `maxDescriptionLines` | `0` | Cap on description lines (`0` = unbounded). Default keeps the full description so the `read` tool's native collapse (`ctrl+o`) handles compactness and the model gets complete context; setting `> 0` applies a lossy head-cap to both the TUI render and the model. |
 | `prompt` | _(built-in)_ | Override the describer system prompt. |
 | `userPromptPrefix` | _(built-in)_ | Override the prefix prepended to your original prompt. |
 
@@ -129,31 +132,47 @@ pi -e ./vision-handoff.ts
 
 ## How It Works
 
-```
-You submit a prompt + image, on a text-only model
-  → before_agent_start
-      • is this model a handoff target? (non-vision, or in handoffModels)
-      • for each attached image → describeImage() with your chosen vision model
-          - complete() via pi-ai (resolves API key/headers/baseUrl for you)
-          - cached by sha256(mime + base64)
-      • fire-and-forget — warms the cache
-  → before_provider_request
-      • walk the provider payload's messages[]
-      • for every image block (detected by shape) → swap for a text block:
-          "[Image: <cached description>]"
-      • returns the modified payload to pi
+Read-tool images (the common case — paste a screenshot, `read` an image file):
 
-Result: the text-only model receives a vivid text description in place of
-the image, and your turn proceeds normally.
-```
+    read tool returns an image block
+      → tool_result (toolName === "read")
+          • fires BEFORE pi-ai's transformMessages can strip the image for
+            non-vision models (the strip would leave only a "(tool image
+            omitted)" placeholder — too late to describe)
+          • is this model a handoff target? (non-vision, or in handoffModels)
+          • for each {type:"image",...} block → describeImage() with your
+            chosen vision model
+              - complete() via pi-ai (resolves API key/headers/baseUrl)
+              - cached by sha256(mime + base64)
+          • AUGMENTS the stored result: inserts "[Image: <description>]" as a
+            text block BEFORE the kept image, returns {content} to pi
+          • the image stays in content → kitty renders it inline
+          • at provider time, pi-ai strips ONLY the image block for non-vision
+            models — the inserted description text passes through to the model
+
+User-attached images (pasted into the prompt, not read via a tool):
+
+    → before_agent_start
+        • warms the description cache for attached images (fire-and-forget)
+    → before_provider_request
+        • walks the provider payload, swaps image blocks for "[Image: <desc>]"
+        • NOTE: for non-vision models, pi-ai strips image blocks BEFORE this
+          hook fires — so user-attached images on text-only models are not yet
+          described. Use the `read` tool on the image file instead, which routes
+          through the tool_result path above.
+
+Result: the text-only model receives a vivid text description alongside the
+(now-stripped) image reference, and your turn proceeds normally — while the
+terminal still renders the image inline via kitty.
 
 ### Image-block formats handled
 
-| API | Image block shape | Replacement |
-|-----|-------------------|-------------|
-| OpenAI Chat Completions | `{ type: "image_url", image_url: { url: "data:…" } }` | `{ type: "text", text }` |
-| OpenAI Responses | `{ type: "input_image", image_url: "data:…" }` | `{ type: "input_text", text }` |
-| Anthropic Messages | `{ type: "image", source: { type: "base64", media_type, data } }` | `{ type: "text", text }` |
+| Hook | Image block shape | Replacement |
+|------|-------------------|-------------|
+| `tool_result` (read) | `{ type: "image", data, mimeType }` (pi-ai internal) | description text block inserted **before** the kept image |
+| `before_provider_request` | `{ type: "image_url", image_url: { url: "data:…" } }` (OpenAI Chat Completions) | `{ type: "text", text }` |
+| `before_provider_request` | `{ type: "input_image", image_url: "data:…" }` (OpenAI Responses) | `{ type: "input_text", text }` |
+| `before_provider_request` | `{ type: "image", source: { type: "base64", media_type, data } }` (Anthropic Messages) | `{ type: "text", text }` |
 
 The describer call itself goes through pi's normal model machinery (`complete()`), **not** the agent event loop — so it never re-triggers `before_provider_request` (no recursion).
 
@@ -171,7 +190,7 @@ The describer call itself goes through pi's normal model machinery (`complete()`
 
 ```bash
 pnpm install
-pnpm test          # Vitest unit tests (31 passing)
+pnpm test          # Vitest unit tests (50 passing)
 pnpm typecheck     # TypeScript validation
 pnpm lint:dead     # Dead code detection (knip)
 ```
@@ -186,7 +205,7 @@ pnpm lint:dead     # Dead code detection (knip)
 │   └── vision-model-selector.ts  # Interactive picker TUI component
 ├── __tests__/unit/
 │   ├── config-dir.test.ts        # Ensures getAgentDir() usage
-│   └── vision-handoff.test.ts    # Config, refs, image-block extraction, round-trip
+│   └── vision-handoff.test.ts    # Config, refs, image-block extraction, insertion, truncation, round-trip
 ├── package.json
 ├── tsconfig.json
 ├── knip.json
