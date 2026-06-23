@@ -41,6 +41,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 - **🗂️ Explicit overrides** — force handoff for specific models (e.g. a weak vision model) with `/vision-handoff add`.
 - **⚡ Cache-warmed** — `before_agent_start` describes attached images the moment you submit, so the request is rarely delayed.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
+- **📊 Usage reporting** — every real describer call reports model + tokens (and Neuralwatt energy/cost when the vision model is a Neuralwatt model), via `pi.appendEntry` + a `vision-handoff:usage` event for live consumers.
 - **🔧 Tunable** — cap description length (`maxDescriptionLines`; unbounded by default, so `read`'s native `ctrl+o` collapse handles compactness) and cache size, in the config file.
 
 ## Usage
@@ -176,6 +177,31 @@ terminal still renders the image inline via kitty.
 
 The describer call itself goes through pi's normal model machinery (`complete()`), **not** the agent event loop — so it never re-triggers `before_provider_request` (no recursion).
 
+### Usage reporting
+
+Every **real** describer call (cache misses only — cache hits emit nothing) reports its model + tokens so pi and other extensions can account for the handoff cost. When the vision model is a **Neuralwatt** model, the response's `: energy` / `: cost` / `: mcr-session` SSE comments are also captured (the OpenAI SDK discards comment lines, so the response body is teed and parsed — the same technique `pi-neuralwatt-provider` uses). For non-Neuralwatt vision models the energy fields are **omitted** (not zeroed), so consumers can distinguish "no energy" from "zero energy".
+
+Each record is published two ways, mirroring `pi-neuralwatt-provider`'s `neuralwatt:turn-energy` pattern:
+
+- **`pi.appendEntry("vision-handoff-usage", record)`** — persisted to the session log, so it replays on `/resume`, fork, and branch navigation.
+- **`pi.events.emit("vision-handoff:usage", record)`** — live event-bus channel a consumer (e.g. a `pi-tps`-style extension) can filter on to see tokens **and** energy in one payload.
+
+Record shape:
+
+```ts
+{
+  imageHash: string,            // sha256(mime + base64), first 32 hex chars
+  model: string, provider: string,
+  responseModel?: string, responseId?: string,
+  usage: Usage,                 // { input, output, cacheRead, cacheWrite, totalTokens, cost }
+  // Present ONLY when Neuralwatt SSE energy comments were captured:
+  energyJoules?: number, costUsd?: number,
+  energyRaw?: object, mcrSessionRaw?: object, costRaw?: object,
+}
+```
+
+Because `before_agent_start` fires several `describeImage()` calls fire-and-forget, the fetch interception is **refcounted** (installed only while ≥1 describe is in flight) and uses `AsyncLocalStorage` to route each teed response body to the describe call that issued it — so concurrent describes each attribute their own energy correctly without clobbering `globalThis.fetch`. When the vision model is a Neuralwatt model, `pi-neuralwatt-provider`'s own `streamNeuralwatt` tee nests on top and restores back to this interceptor; both tees read the same comment lines independently (the accepted duplication for easy filtering).
+
 ## Comparison with Alternatives
 
 | Approach | Pros | Cons |
@@ -190,7 +216,7 @@ The describer call itself goes through pi's normal model machinery (`complete()`
 
 ```bash
 pnpm install
-pnpm test          # Vitest unit tests (50 passing)
+pnpm test          # Vitest unit tests (77 passing)
 pnpm typecheck     # TypeScript validation
 pnpm lint:dead     # Dead code detection (knip)
 ```
@@ -201,10 +227,12 @@ pnpm lint:dead     # Dead code detection (knip)
 .
 ├── vision-handoff.ts            # Main extension: hooks, command, describer
 ├── src/
-│   ├── index.ts                  # Config schema, read/write, image-block helpers
+│   ├── index.ts                  # Config schema, read/write, image-block helpers (barrel)
+│   ├── usage.ts                  # Describer usage + Neuralwatt energy capture, fetch interceptor
 │   └── vision-model-selector.ts  # Interactive picker TUI component
 ├── __tests__/unit/
 │   ├── config-dir.test.ts        # Ensures getAgentDir() usage
+│   ├── usage.test.ts             # Energy parsing, usage records, concurrency-safe fetch routing
 │   └── vision-handoff.test.ts    # Config, refs, image-block extraction, insertion, truncation, round-trip
 ├── package.json
 ├── tsconfig.json

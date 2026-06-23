@@ -37,20 +37,34 @@ import {
   HANDOFF_COMMAND_DESCRIPTION,
   IMAGE_PLACEHOLDER_PREFIX,
   IMAGE_PLACEHOLDER_SUFFIX,
+  USAGE_ENTRY_TYPE,
+  USAGE_EVENT_CHANNEL,
+  EMPTY_ENERGY_CAPTURE,
+  buildUsageRecord,
+  describeAls,
   extractImageFromBlock,
   formatModelRef,
   insertImageDescriptions,
+  installFetchInterceptor,
   isVisionModel,
   makeReplacementText,
   parseModelRef,
   readConfig,
   truncateDescription,
+  uninstallFetchInterceptor,
   writeConfig,
+  type DescribeContext,
   type VisionHandoffConfig,
+  type VisionHandoffEnergyCapture,
+  type VisionHandoffUsageRecord,
 } from "./src/index.js";
 import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
 
 const UNAVAILABLE = `${IMAGE_PLACEHOLDER_PREFIX}description unavailable${IMAGE_PLACEHOLDER_SUFFIX}`;
+
+// Usage reporter; wired to pi.appendEntry + pi.events.emit in the default
+// export. No-op until then so describeImage is safe to call before wiring.
+let reportUsage: (record: VisionHandoffUsageRecord) => void = () => {};
 
 let config: VisionHandoffConfig = readConfig();
 
@@ -125,17 +139,38 @@ async function describeImage(
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DESCRIBE_TIMEOUT_MS);
+    // Energy/token capture for this describer call. The fetch interceptor is
+    // refcount-installed around the complete() window and routes the teed
+    // response body to this describe's AsyncLocalStorage slot — so concurrent
+    // describes (before_agent_start warm-up fires several in parallel) each
+    // get their own capture without clobbering globalThis.fetch. For non-
+    // Neuralwatt vision models no SSE energy comments are present and the
+    // capture stays empty (energy fields omitted from the record).
+    const describeCtx: DescribeContext = { energyReader: undefined };
+    installFetchInterceptor();
     try {
-      const response = await complete(
-        visionModel,
-        { systemPrompt, messages: [userMessage] },
-        {
-          apiKey: auth.apiKey,
-          headers: auth.headers,
-          signal: controller.signal,
-          maxTokens: cfg.maxTokens,
-        },
+      const response = await describeAls.run(describeCtx, async () =>
+        complete(
+          visionModel,
+          { systemPrompt, messages: [userMessage] },
+          {
+            apiKey: auth.apiKey,
+            headers: auth.headers,
+            signal: controller.signal,
+            maxTokens: cfg.maxTokens,
+          },
+        ),
       );
+      let capture: VisionHandoffEnergyCapture = EMPTY_ENERGY_CAPTURE;
+      if (describeCtx.energyReader) {
+        try {
+          capture = await describeCtx.energyReader;
+        } catch {
+          // tee aborted with the main stream — keep the empty capture
+        }
+      }
+      const record = buildUsageRecord(response, capture, visionModel, key);
+      if (record) reportUsage(record);
       if (response.stopReason === "aborted" || response.stopReason === "error") {
         return UNAVAILABLE;
       }
@@ -159,6 +194,8 @@ async function describeImage(
     } catch {
       return UNAVAILABLE;
     } finally {
+      if (describeCtx.energyReader) describeCtx.energyReader.catch(() => {});
+      uninstallFetchInterceptor();
       clearTimeout(timer);
     }
   })();
@@ -212,6 +249,26 @@ function notifyUnresolvedVisionModel(ctx: ExtensionContext, ref: string): void {
 
 export default function (pi: ExtensionAPI) {
   config = readConfig();
+
+  // Wire the usage reporter to pi's persistence + event bus. appendEntry
+  // persists the record so it replays on session resume/branch, and the event
+  // lets live consumers filter on one channel for tokens AND energy. Each call
+  // is independently guarded so a persistence/emit failure never breaks a
+  // describer turn. Re-assigned every factory invocation (pi re-runs the
+  // factory on /new, /resume, fork, /reload) so the closure always references
+  // the live pi.
+  reportUsage = (record: VisionHandoffUsageRecord) => {
+    try {
+      pi.appendEntry(USAGE_ENTRY_TYPE, record);
+    } catch {
+      // never break the describer on persistence failure
+    }
+    try {
+      pi.events?.emit(USAGE_EVENT_CHANNEL, record);
+    } catch {
+      // never break the describer on emit failure
+    }
+  };
 
   pi.on("session_start", async () => {
     // Reload in case the user edited the config on disk from another session.

@@ -10,6 +10,8 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+export * from "./usage.js";
+
 /** Subdirectory under the pi agent dir where picker extensions store config. */
 const CONFIG_SUBDIR = "extensions";
 
