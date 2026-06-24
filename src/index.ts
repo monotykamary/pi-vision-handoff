@@ -38,8 +38,21 @@ export const DEFAULT_USER_PROMPT_PREFIX = "The user's request about this image: 
 export const IMAGE_PLACEHOLDER_PREFIX = "[Image: ";
 export const IMAGE_PLACEHOLDER_SUFFIX = "]";
 
-/** Default max output tokens for a single image description. */
-export const DEFAULT_MAX_TOKENS = 1024;
+/** Marker appended to a description whose `complete()` call ended with
+ *  `stopReason: "length"` — i.e. the vision model hit a token limit (either the
+ *  configured `maxTokens` or the provider's hard output cap) before finishing.
+ *  A truncated description is still useful, but the agent must not mistake it
+ *  for the complete picture (it would reason as if the image contained only
+ *  what made it into the text). The marker makes the cut-off visible to both
+ *  the agent (it reads the marker in the tool result / context) and the user
+ *  (it renders inline). */
+export const DESCRIPTION_TRUNCATED_MARKER =
+  "\n\n[... description truncated — the vision model reached its output token limit. The above may be incomplete; raise maxTokens or use a higher-output vision model for the full description.]";
+
+/** Append the {@link DESCRIPTION_TRUNCATED_MARKER} to a raw description. */
+export function markDescriptionTruncated(text: string): string {
+  return text + DESCRIPTION_TRUNCATED_MARKER;
+}
 
 /** Default vision cache size (number of described images kept in memory per session). */
 export const DEFAULT_CACHE_MAX = 50;
@@ -103,8 +116,13 @@ export interface VisionHandoffConfig {
   autoHandoff: boolean;
   /** Extra "provider/id" refs that should ALSO receive handoff (e.g. weak vision models). */
   handoffModels: string[];
-  /** Max output tokens for a single description. */
-  maxTokens: number;
+  /** Max output tokens for a single description. `undefined` (default) = use the
+   *  vision model's declared max output (`model.maxTokens`) as the cap — the
+   *  highest the model supports — so the "be exhaustive" prompt isn't defeated
+   *  by a provider's small omitted-default. Set a number only to cap lower.
+   *  A truncation is always surfaced via {@link DESCRIPTION_TRUNCATED_MARKER}
+   *  when the model hits the limit. */
+  maxTokens?: number;
   /** Max images kept in the in-memory description cache. */
   cacheMax: number;
   /**
@@ -124,7 +142,7 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   visionModel: null,
   autoHandoff: true,
   handoffModels: [],
-  maxTokens: DEFAULT_MAX_TOKENS,
+  maxTokens: undefined,
   cacheMax: DEFAULT_CACHE_MAX,
   maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
 };
@@ -171,6 +189,8 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
       .map((m) => m.trim())
       .filter((m) => m && parseModelRef(m));
   }
+  // maxTokens: optional. undefined (default) = no artificial cap. Only set when
+  // a valid positive finite number is given; any other value leaves it unset.
   if (typeof obj.maxTokens === "number" && Number.isFinite(obj.maxTokens) && obj.maxTokens > 0) {
     base.maxTokens = Math.floor(obj.maxTokens);
   }

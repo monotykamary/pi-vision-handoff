@@ -28,7 +28,7 @@ function makeLoader(overrides: Partial<LoaderDeps> = {}): DescriptionLoader {
     visionModel: "p/id",
     autoHandoff: true,
     handoffModels: [],
-    maxTokens: 1024,
+    maxTokens: undefined,
     cacheMax: 50,
     maxDescriptionLines: 0,
   };

@@ -72,7 +72,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
   "visionModel": "openai/gpt-4o",
   "autoHandoff": true,
   "handoffModels": ["ollama/llava:13b"],
-  "maxTokens": 1024,
+  "maxTokens": null,
   "cacheMax": 50,
   "maxDescriptionLines": 0,
   "prompt": "Describe this image exhaustively…",
@@ -86,7 +86,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `visionModel` | `null` | The describer, as `provider/id`. `null` = not configured (handoff inactive). |
 | `autoHandoff` | `true` | Apply handoff to every model whose `input` does not include `image`. |
 | `handoffModels` | `[]` | Extra `provider/id` refs that should also receive handoff. |
-| `maxTokens` | `1024` | Cap on a single description's output. |
+| `maxTokens` | _(unset = model max, clamped to context window)_ | Cap on a single description's output. `null`/unset = use the vision model's declared max output (`model.maxTokens`), clamped so `maxTokens + 8192 <= contextWindow` (a model whose declared max equals its full context window would otherwise be rejected with a 400). Set a number only to cap cost/latency. A truncation is always surfaced via a `[... description truncated …]` marker when the model hits the limit, so a cut-off description is never mistaken for complete. |
 | `cacheMax` | `50` | Max described images kept in the in-memory cache per session. |
 | `maxDescriptionLines` | `0` | Cap on description lines (`0` = unbounded). Default keeps the full description so the `read` tool's native collapse (`ctrl+o`) handles compactness and the model gets complete context; setting `> 0` applies a lossy head-cap to both the TUI render and the model. |
 | `prompt` | _(built-in)_ | Override the describer system prompt. |
@@ -232,6 +232,22 @@ budget (45s × (imageCount − 1)), so a 5-image batch isn't held to the same
 wall-clock budget as one image. A timeout surfaces as `describer timed out
 after <N>s` rather than a misleading `stopReason "aborted"`.
 
+**No silent truncation.** The describer prompt says "be exhaustive", so the
+default `maxTokens` is **unset** — the describer uses the vision model's
+declared max output (`model.maxTokens`) as the cap, rather than relying on a
+provider's small omitted-default. That value is clamped so `maxTokens + 8192
+<= contextWindow`: a model whose declared `maxTokens` equals its full
+`contextWindow` (e.g. a custom provider that sets both to the same number)
+would otherwise be rejected by the provider with a 400 (you can't request
+output tokens equal to the entire context window when you also have input),
+so the clamp subtracts a small input reserve. If the model still hits a token
+limit (a cap you set, or the provider's hard output maximum), `stopReason`
+becomes `"length"`; the describer appends a visible
+`[... description truncated …]` marker to the (still useful) partial text
+rather than letting a cut-off description pass as complete. For a batched call
+the marker lands on the last image being emitted when the cap hit (the one cut
+off mid-stream); earlier sections had `<<<END>>>` delimiters and are complete.
+
 **Aborts propagate.** The `context` hook runs in the foreground (pi awaits
 it before the LLM call), so a slow describer would also make aborting a turn
 slow — pi has to wait for the transform to return. The hook therefore wires
@@ -322,6 +338,7 @@ pnpm lint:dead     # Dead code detection (knip)
 │   ├── usage.test.ts             # Energy parsing, usage records, concurrency-safe fetch routing
 │   ├── vision-handoff.test.ts    # Config, refs, image-block extraction, insertion, truncation, round-trip
 │   ├── dataloader.test.ts        # Batch coalescing, memoization, failure eviction, Disposable reset
+│   ├── describer.test.ts        # stopReason handling (length → truncation marker, aborted/error)
 │   ├── image.test.ts             # MIME sniffing, clipboard-path confinement, file reading
 │   └── dispose.test.ts           # `using` guards: fetch refcount, timeout, abort-wire propagation
 ├── package.json

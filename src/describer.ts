@@ -26,6 +26,7 @@ import {
   DEFAULT_USER_PROMPT_PREFIX,
   DEFAULT_VISION_PROMPT,
   describeTimeoutMs,
+  markDescriptionTruncated,
   parseBatchedDescriptions,
   type ExtractedImage,
   type VisionHandoffConfig,
@@ -40,6 +41,40 @@ import {
 } from "./usage.js";
 import { imageHash } from "./image.js";
 import { abortWireGuard, fetchInterceptorGuard, timeoutGuard, type AbortWire } from "./dispose.js";
+
+/** Tokens reserved for the describer's input so the requested output budget
+ *  can't exceed the model's context window. The describer's input is bounded —
+ *  one (or a few) image(s) plus a short prompt — so a fixed reserve keeps the
+ *  math simple while leaving generous room for the image + prompt tokens.
+ *  Providers reject a request when `inputTokens + maxTokens > contextWindow`
+ *  (e.g. a model whose declared maxTokens equals its full context window), so
+ *  this clamp prevents that 400 without meaningfully limiting a high-output
+ *  model (e.g. 262144 context − 8192 reserve = 253952 output budget). */
+const INPUT_RESERVE_TOKENS = 8192;
+
+/** Resolve the `maxTokens` to pass to `complete()` for a describer call.
+ *
+ *  - A configured `cfg.maxTokens` wins (explicit cost/latency cap), clamped to
+ *    fit the context window.
+ *  - Otherwise use the vision model's declared max output (`model.maxTokens`),
+ *    clamped so `maxTokens + INPUT_RESERVE_TOKENS <= contextWindow` — i.e. the
+ *    requested output can't exceed the context window minus a reserve for the
+ *    input. This is the real fix for models whose declared `maxTokens` equals
+ *    their full `contextWindow` (which providers reject with any non-empty
+ *    input): we cap at `contextWindow − reserve` instead.
+ *  - If the model declares no usable max (`maxTokens <= 0`) and no cap is
+ *    configured, return `undefined` so the provider applies its own default. */
+export function resolveMaxTokens(
+  cfg: VisionHandoffConfig,
+  visionModel: Model<Api>,
+): number | undefined {
+  const ctx = visionModel.contextWindow > 0 ? visionModel.contextWindow : Number.POSITIVE_INFINITY;
+  const cap = ctx - INPUT_RESERVE_TOKENS;
+  const requested = cfg.maxTokens ?? (visionModel.maxTokens > 0 ? visionModel.maxTokens : undefined);
+  if (requested === undefined) return undefined;
+  // Clamp to the context-window-derived ceiling; never below 1.
+  return Math.max(1, Math.min(requested, cap));
+}
 
 /** Dependencies the describer can't own itself (held by the engine). */
 export interface DescriberDeps {
@@ -90,6 +125,7 @@ export async function runBatch(
   const userMessage: Message = { role: "user", content, timestamp: Date.now() };
 
   const timeoutMs = describeTimeoutMs(misses.length);
+  const maxTokens = resolveMaxTokens(cfg, visionModel);
   const controller = new AbortController();
   let timedOut = false;
   using fetchGuard = fetchInterceptorGuard();
@@ -105,7 +141,7 @@ export async function runBatch(
       complete(
         visionModel,
         { systemPrompt, messages: [userMessage] },
-        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens: cfg.maxTokens },
+        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens },
       ),
     );
     const capture = await readCapture(describeCtx);
@@ -129,6 +165,23 @@ export async function runBatch(
     for (let i = 0; i < misses.length; i++) {
       const d = parsed[i];
       if (d) out.set(misses[i].hash, d);
+    }
+    // stopReason "length" = the batch response was cut off mid-stream. The last
+    // image being emitted when the cap hit is the one whose section is truncated
+    // (parseBatchedDescriptions still captures it via the end-of-text lookahead,
+    // just with partial content). Mark that one — the highest-index parsed slot —
+    // so the agent/user know it's incomplete. Earlier sections had `<<<END>>>`
+    // markers and are complete. We deliberately do NOT re-describe the truncated
+    // image: a single call for the same complex image would likely hit the same
+    // limit, so the partial text + marker is the honest, no-wasted-call result.
+    if (response.stopReason === "length") {
+      for (let i = misses.length - 1; i >= 0; i--) {
+        const h = misses[i].hash;
+        if (out.has(h)) {
+          out.set(h, markDescriptionTruncated(out.get(h)!));
+          break;
+        }
+      }
     }
     // Fallback: a failed delimiter-parse is NOT a failed description — it's a
     // failed batching. Describe each unparsed image with its own single-image
@@ -185,6 +238,7 @@ export async function describeSingle(
   ];
   const userMessage: Message = { role: "user", content, timestamp: Date.now() };
   const timeoutMs = describeTimeoutMs(1);
+  const maxTokens = resolveMaxTokens(cfg, visionModel);
   const controller = new AbortController();
   let timedOut = false;
   using fetchGuard = fetchInterceptorGuard();
@@ -200,7 +254,7 @@ export async function describeSingle(
       complete(
         visionModel,
         { systemPrompt, messages: [userMessage] },
-        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens: cfg.maxTokens },
+        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens },
       ),
     );
     const capture = await readCapture(describeCtx);
@@ -216,8 +270,14 @@ export async function describeSingle(
       .map((c) => c.text)
       .join("\n")
       .trim();
-    if (!text) deps.setLastError("vision model returned an empty description");
-    return text || null;
+    if (!text) {
+      deps.setLastError("vision model returned an empty description");
+      return null;
+    }
+    // stopReason "length" = the model hit a token limit (configured maxTokens or
+    // the provider's hard output cap) before finishing. The partial text is still
+    // useful, but it must not pass as complete — mark it so the agent/user know.
+    return response.stopReason === "length" ? markDescriptionTruncated(text) : text;
   } catch (err) {
     deps.setLastError(
       timedOut ? `describer timed out after ${timeoutMs / 1000}s` : err instanceof Error ? err.message : String(err),

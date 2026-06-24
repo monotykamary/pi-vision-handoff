@@ -5,12 +5,14 @@ import { join } from "node:path";
 
 import {
   DEFAULT_CONFIG,
+  DESCRIPTION_TRUNCATED_MARKER,
   extractImageFromBlock,
   formatModelRef,
   getConfigPath,
   insertImageDescriptions,
   isVisionModel,
   makeReplacementText,
+  markDescriptionTruncated,
   NON_VISION_IMAGE_NOTE,
   normalizeConfig,
   parseDataUrl,
@@ -110,6 +112,18 @@ describe("normalizeConfig", () => {
     const cfg = normalizeConfig({ maxTokens: -10, cacheMax: "big" });
     expect(cfg.maxTokens).toBe(DEFAULT_CONFIG.maxTokens);
     expect(cfg.cacheMax).toBe(DEFAULT_CONFIG.cacheMax);
+  });
+
+  it("maxTokens is optional: undefined by default (no artificial cap)", () => {
+    expect(DEFAULT_CONFIG.maxTokens).toBeUndefined();
+    expect(normalizeConfig({}).maxTokens).toBeUndefined();
+    expect(normalizeConfig({ maxTokens: null }).maxTokens).toBeUndefined();
+    expect(normalizeConfig({ maxTokens: "1024" }).maxTokens).toBeUndefined();
+  });
+
+  it("maxTokens accepts a positive finite number and floors it", () => {
+    expect(normalizeConfig({ maxTokens: 2048 }).maxTokens).toBe(2048);
+    expect(normalizeConfig({ maxTokens: 1024.9 }).maxTokens).toBe(1024);
   });
 
   it("accepts maxDescriptionLines, including 0 (unbounded)", () => {
@@ -547,6 +561,23 @@ describe("wrapDescription", () => {
   it("leaves the description unbounded when maxDescriptionLines is 0 (default)", () => {
     const long = "line1\nline2\nline3\nline4";
     expect(wrapDescription(long, DEFAULT_CONFIG)).toBe(`[Image: ${long}]`);
+  });
+});
+
+describe("markDescriptionTruncated", () => {
+  it("appends the truncation marker to a raw description", () => {
+    expect(markDescriptionTruncated("partial text")).toBe(`partial text${DESCRIPTION_TRUNCATED_MARKER}`);
+  });
+
+  it("the marker survives wrapDescription (stays inside the [Image: …] envelope)", () => {
+    expect(wrapDescription(markDescriptionTruncated("partial"), DEFAULT_CONFIG)).toBe(
+      `[Image: partial${DESCRIPTION_TRUNCATED_MARKER}]`,
+    );
+  });
+
+  it("the marker mentions the token limit so the agent/user know it's incomplete", () => {
+    expect(DESCRIPTION_TRUNCATED_MARKER).toMatch(/truncat/i);
+    expect(DESCRIPTION_TRUNCATED_MARKER).toMatch(/token/i);
   });
 });
 

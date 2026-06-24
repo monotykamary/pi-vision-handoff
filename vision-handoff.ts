@@ -49,7 +49,8 @@ import {
   type VisionHandoffUsageRecord,
 } from "./src/usage.js";
 import { DescriptionLoader, UNAVAILABLE, type LoaderDeps } from "./src/dataloader.js";
-import { imageHash, findClipboardImagePaths, readImageFile } from "./src/image.js";
+import { imageHash, findClipboardImagePaths, readImageBuffer, resolvePrewarmImage } from "./src/image.js";
+import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
 
 let config: VisionHandoffConfig = readConfig();
@@ -214,15 +215,27 @@ export default function (pi: ExtensionAPI) {
       loader.loadDescription({ data: image.data, mimeType: image.mimeType || "image/png" }).catch(() => {});
     }
 
-    // Pasted clipboard image paths in the prompt text — read the files and
-    // warm the loader. Read synchronously (see readImageFile) so all
-    // loadDescription() calls — attached + clipboard-path — land in ONE batch
-    // frame → ONE vision call. Fire-and-forget: a file that can't be read or
-    // isn't an image is skipped (the agent's `read` will still describe it via
-    // `tool_result` if the agent reads it).
+    // Pasted clipboard image paths in the prompt text — resolve each to the
+    // SAME ExtractedImage pi's `read` tool will emit, then warm the loader so
+    // the `tool_result`'s `loadDescription()` is a cache hit (no wasted vision
+    // call). pi's read tool resizes images by default: for a small image it
+    // returns the raw bytes unchanged (our raw read matches), but for an
+    // oversized image it RE-ENCODES via Photon — so we run the same
+    // `resizeImage` pipeline to produce a matching key. The resize branch is
+    // async (worker thread) and fire-and-forget; its `loadDescription()` lands
+    // in a later batch than the no-resize images, so a mixed small+oversized
+    // paste may split into two vision calls (still no WASTED call — each
+    // describes an image the agent will see). A file that can't be read, isn't
+    // a supported image, or fails to resize is skipped (the agent's `read`
+    // will still describe it via `tool_result` if it emits an image block).
     for (const p of findClipboardImagePaths(event.prompt || "")) {
-      const img = readImageFile(p);
-      if (img) loader.loadDescription(img).catch(() => {});
+      const read = readImageBuffer(p);
+      if (!read) continue;
+      resolvePrewarmImage(read.buf, read.mimeType, resizeImage)
+        .then((img) => {
+          if (img) loader.loadDescription(img).catch(() => {});
+        })
+        .catch(() => {});
     }
   });
 
@@ -613,7 +626,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
   lines.push(`Vision model: ${config.visionModel ?? "(none — pick one with /vision-handoff)"}`);
   lines.push(`Auto handoff (non-vision models): ${config.autoHandoff ? "on" : "off"}`);
   lines.push(`Handoff targets (explicit): ${config.handoffModels.length ? config.handoffModels.join(", ") : "(none)"}`);
-  lines.push(`maxTokens: ${config.maxTokens} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
+  lines.push(`maxTokens: ${config.maxTokens ?? "unbounded"} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
 
   const model = ctx.model;
   let active = false;
