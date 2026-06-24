@@ -15,10 +15,14 @@ import {
   normalizeConfig,
   parseDataUrl,
   parseModelRef,
+  parseBatchedDescriptions,
+  batchUserPrompt,
   readConfig,
   stripNonVisionImageNote,
   truncateDescription,
+  wrapDescription,
   writeConfig,
+  BATCH_IMAGE_MARKER_END,
   type VisionHandoffConfig,
 } from "../../src/index.js";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
@@ -439,5 +443,137 @@ describe("stripNonVisionImageNote", () => {
     const stripped = stripNonVisionImageNote(original);
     expect(stripped).toBe("prefix");
     expect(original).toBe(`prefix\n${NON_VISION_IMAGE_NOTE}`);
+  });
+});
+
+describe("batchUserPrompt", () => {
+  it("returns the single-image prompt (no markers) for count <= 1", () => {
+    expect(batchUserPrompt(1, "what is this?", "Q: ")).toBe("Q: what is this?");
+    // count 0 is treated like a single image
+    expect(batchUserPrompt(0, "x", "P: ")).toBe("P: x");
+  });
+
+  it("falls back to a bare describe instruction when there is no user prompt (single)", () => {
+    expect(batchUserPrompt(1, "", "P: ")).toBe("Describe this image.");
+    expect(batchUserPrompt(1, "   ", "P: ")).toBe("Describe this image.");
+  });
+
+  it("emits per-image marker instructions for a batch and folds in the user prompt", () => {
+    const out = batchUserPrompt(3, "compare these", "The user's request about this image: ");
+    expect(out).toContain("Describe each of the 3 images below");
+    expect(out).toContain("<<<IMAGE k>>>");
+    expect(out).toContain(BATCH_IMAGE_MARKER_END);
+    expect(out).toContain("The user's request about this image: compare these");
+  });
+
+  it("omits the user-prompt section entirely when there is no user prompt (batch)", () => {
+    const out = batchUserPrompt(2, "", "P: ");
+    expect(out).toContain("<<<IMAGE k>>>");
+    expect(out).not.toContain("P: ");
+  });
+});
+
+describe("parseBatchedDescriptions", () => {
+  it("returns the whole text as the single description for count <= 1 (no markers)", () => {
+    expect(parseBatchedDescriptions("a plain description with no markers", 1)).toEqual([
+      "a plain description with no markers",
+    ]);
+  });
+
+  it("strips a lone <<<IMAGE 1>>> wrapper if the model emitted one for a single image", () => {
+    const text = `<<<IMAGE 1>>>
+inner description
+<<<END>>>`;
+    expect(parseBatchedDescriptions(text, 1)).toEqual(["inner description"]);
+  });
+
+  it("returns [null] for an empty single-image response", () => {
+    expect(parseBatchedDescriptions("   ", 1)).toEqual([null]);
+    expect(parseBatchedDescriptions("", 1)).toEqual([null]);
+  });
+
+  it("parses N delimited sections in order into N slots", () => {
+    const text = [
+      "<<<IMAGE 1>>>",
+      "desc one",
+      "<<<END>>>",
+      "<<<IMAGE 2>>>",
+      "desc two",
+      "<<<END>>>",
+      "<<<IMAGE 3>>>",
+      "desc three",
+      "<<<END>>>",
+    ].join("\n");
+    expect(parseBatchedDescriptions(text, 3)).toEqual(["desc one", "desc two", "desc three"]);
+  });
+
+  it("tolerates a missing <<<END>>> on the last section", () => {
+    const text = "<<<IMAGE 1>>>\ndesc one\n<<<END>>>\n<<<IMAGE 2>>>\ndesc two";
+    expect(parseBatchedDescriptions(text, 2)).toEqual(["desc one", "desc two"]);
+  });
+
+  it("degrades missing/unparseable sections to null without voiding the rest", () => {
+    // image 2's section is entirely absent; images 1 and 3 parse fine
+    const text = "<<<IMAGE 1>>>\ndesc one\n<<<END>>>\n<<<IMAGE 3>>>\ndesc three\n<<<END>>>";
+    expect(parseBatchedDescriptions(text, 3)).toEqual(["desc one", null, "desc three"]);
+  });
+
+  it("treats an empty section body as null (unavailable)", () => {
+    const text = "<<<IMAGE 1>>>\n\n<<<END>>>\n<<<IMAGE 2>>>\ndesc two\n<<<END>>>";
+    expect(parseBatchedDescriptions(text, 2)).toEqual([null, "desc two"]);
+  });
+
+  it("ignores out-of-range / duplicate section indices (first-wins)", () => {
+    const text =
+      "<<<IMAGE 1>>>\nfirst\n<<<END>>>\n<<<IMAGE 1>>>\nsecond\n<<<END>>>\n<<<IMAGE 9>>>\nfar\n<<<END>>>";
+    expect(parseBatchedDescriptions(text, 2)).toEqual(["first", null]);
+  });
+
+  it("returns all-null when the response has no markers for a batch", () => {
+    expect(parseBatchedDescriptions("the model ignored the format", 3)).toEqual([null, null, null]);
+  });
+});
+
+describe("wrapDescription", () => {
+  it("wraps a raw description in the [Image: …] envelope", () => {
+    expect(wrapDescription("a vivid scene", DEFAULT_CONFIG)).toBe("[Image: a vivid scene]");
+  });
+
+  it("applies the configured line cap when maxDescriptionLines > 0", () => {
+    const cfg: VisionHandoffConfig = { ...DEFAULT_CONFIG, maxDescriptionLines: 2 };
+    expect(wrapDescription("a\nb\nc\nd", cfg)).toBe("[Image: a\nb\n... (2 more lines)]");
+  });
+
+  it("leaves the description unbounded when maxDescriptionLines is 0 (default)", () => {
+    const long = "line1\nline2\nline3\nline4";
+    expect(wrapDescription(long, DEFAULT_CONFIG)).toBe(`[Image: ${long}]`);
+  });
+});
+
+describe("insertImageDescriptions with a batched (pre-resolved) describe callback", () => {
+  const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+  const textBlock = { type: "text", text: "hello" } as const;
+
+  it("uses the pre-resolved map keyed by image hash, one describe source for many images", async () => {
+    // Simulate the batched path: a single Map<hash, description> feeds
+    // insertImageDescriptions via a lookup callback, so the insertion helper
+    // stays image-agnostic and testable without a provider.
+    const imgA: ImageContent = { type: "image", data: "AAA", mimeType: "image/png" };
+    const imgB: ImageContent = { type: "image", data: "BBB", mimeType: "image/png" };
+    const map = new Map<string, string>([
+      ["AAA\x00image/png", "[Image: desc A]"],
+      ["BBB\x00image/png", "[Image: desc B]"],
+    ]);
+    const lookup = async (img: { data: string; mimeType: string }) =>
+      map.get(`${img.data}\x00${img.mimeType}`) ?? "[Image: description unavailable]";
+    const result = await insertImageDescriptions([imgA, textBlock, imgB], lookup);
+    expect(result.changed).toBe(true);
+    expect(result.content).toEqual([
+      { type: "text", text: "[Image: desc A]" },
+      imgA,
+      textBlock,
+      { type: "text", text: "[Image: desc B]" },
+      imgB,
+    ]);
   });
 });

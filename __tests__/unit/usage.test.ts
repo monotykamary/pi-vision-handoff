@@ -248,6 +248,30 @@ describe("buildUsageRecord", () => {
     );
     expect(rec).not.toBeNull();
   });
+
+  it("omits imageHashes for a single-image call (unchanged shape)", () => {
+    const rec = buildUsageRecord(makeMessage(), EMPTY_ENERGY_CAPTURE, makeModel(), "h");
+    expect(rec!.imageHash).toBe("h");
+    expect("imageHashes" in rec!).toBe(false);
+  });
+
+  it("lists imageHashes only for a genuine batch (length > 1), with the first as representative", () => {
+    const rec = buildUsageRecord(
+      makeMessage(),
+      EMPTY_ENERGY_CAPTURE,
+      makeModel(),
+      "h1",
+      ["h1", "h2", "h3"],
+    );
+    expect(rec!.imageHash).toBe("h1");
+    expect(rec!.imageHashes).toEqual(["h1", "h2", "h3"]);
+  });
+
+  it("does not set imageHashes when a single-element array is passed", () => {
+    const rec = buildUsageRecord(makeMessage(), EMPTY_ENERGY_CAPTURE, makeModel(), "h1", ["h1"]);
+    expect(rec!.imageHash).toBe("h1");
+    expect("imageHashes" in rec!).toBe(false);
+  });
 });
 
 // ── fetch interceptor + ALS routing ──────────────────────────────────────────

@@ -3,3 +3,7 @@ allowBuilds:
   protobufjs: false
 minimumReleaseAgeExclude:
   - '@earendil-works/pi-ai@0.79.10'
+  - '@earendil-works/pi-agent-core@0.80.2'
+  - '@earendil-works/pi-ai@0.80.2'
+  - '@earendil-works/pi-coding-agent@0.80.2'
+  - '@earendil-works/pi-tui@0.80.2'

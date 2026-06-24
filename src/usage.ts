@@ -49,9 +49,19 @@ export const EMPTY_ENERGY_CAPTURE: VisionHandoffEnergyCapture = {
 };
 
 /** A single describer-call usage record. Energy fields are present only when
- *  Neuralwatt SSE energy comments were captured (omitted, not zeroed, otherwise). */
+ *  Neuralwatt SSE energy comments were captured (omitted, not zeroed, otherwise).
+ *
+ *  One record is emitted per REAL describer provider call (cache hits emit
+ *  nothing). A batched call that describes several images at once still emits a
+ *  single record: `imageHash` is the representative (first) member and
+ *  `imageHashes` lists every image the call covered, so consumers can attribute
+ *  the call's tokens/energy to each member image without double-counting. */
 export interface VisionHandoffUsageRecord {
+  /** Representative image hash (first member of the batch). */
   imageHash: string;
+  /** All image hashes covered by this describer call. Present only for batched
+   *  calls (length > 1); omitted for single-image calls. */
+  imageHashes?: string[];
   model: string;
   provider: string;
   responseModel?: string;
@@ -148,6 +158,7 @@ export function buildUsageRecord(
   capture: VisionHandoffEnergyCapture,
   visionModel: Model<Api>,
   imageHash: string,
+  imageHashes?: string[],
 ): VisionHandoffUsageRecord | null {
   const hasEnergy = !!(
     capture.energyRaw ||
@@ -169,6 +180,11 @@ export function buildUsageRecord(
     responseId: response.responseId,
     usage: response.usage,
   };
+  // Present only for genuine batched calls (more than one image). Keeps the
+  // single-image record shape unchanged for existing consumers.
+  if (imageHashes && imageHashes.length > 1) {
+    record.imageHashes = imageHashes;
+  }
   if (hasEnergy) {
     record.energyJoules = capture.energyJoules;
     record.costUsd = capture.costUsd;

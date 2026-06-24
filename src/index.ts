@@ -44,8 +44,20 @@ export const DEFAULT_MAX_TOKENS = 1024;
 /** Default vision cache size (number of described images kept in memory per session). */
 export const DEFAULT_CACHE_MAX = 50;
 
-/** Per-description request timeout. */
-export const DESCRIBE_TIMEOUT_MS = 30_000;
+/** Per-description request timeout. Generous because the describer generates an
+ *  exhaustive multi-paragraph description per image; a single image commonly
+ *  takes ~20s, and a batched call over websocket transport scales with image
+ *  count. {@link describeTimeoutMs} scales this per batch size. */
+export const DESCRIBE_TIMEOUT_MS = 120_000;
+
+/** Per-batch timeout: the base timeout plus a per-image budget so a 5-image
+ *  batch isn't held to the same wall-clock budget as a single image. The
+ *  describer generates exhaustive prose per image, and websocket transport
+ *  adds latency, so the budget scales with the number of images in the call. */
+export function describeTimeoutMs(imageCount: number): number {
+  const perImage = 45_000;
+  return DESCRIBE_TIMEOUT_MS + Math.max(0, imageCount - 1) * perImage;
+}
 
 /**
  * Default cap on the number of lines kept from a description before truncation.
@@ -290,6 +302,100 @@ export function truncateDescription(text: string, maxLines: number): TruncatedDe
   const hidden = lines.length - maxLines;
   const kept = lines.slice(0, maxLines).join("\n");
   return { text: `${kept}\n... (${hidden} more lines)`, truncated: true, hidden };
+}
+
+/** Start marker for the k-th image section in a batched describer response. */
+export const BATCH_IMAGE_MARKER_START = "<<<IMAGE";
+/** End marker closing a single image section in a batched describer response. */
+export const BATCH_IMAGE_MARKER_END = "<<<END>>>";
+
+/** Escape a literal string for use in a RegExp. */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Section regexes built from the marker constants so the producer
+// (batchUserPrompt) and consumer (parseBatchedDescriptions) share one source of
+// truth for the delimiter format. A lone `<<<IMAGE k>>> … <<<END>>>` wrapper
+// for a single image; a global scan for the multi-image case that stops at the
+// next start marker, the end marker, or end-of-text.
+const SECTION_SINGLE_RE = new RegExp(
+  `${escapeRe(BATCH_IMAGE_MARKER_START)}\\s+1>>>\\s*([\\s\\S]*?)${escapeRe(BATCH_IMAGE_MARKER_END)}`,
+);
+const SECTION_MULTI_RE = new RegExp(
+  `${escapeRe(BATCH_IMAGE_MARKER_START)}\\s+(\\d+)>>>\\s*([\\s\\S]*?)(?=${escapeRe(
+    BATCH_IMAGE_MARKER_START,
+  )}\\s+\\d+>>>|${escapeRe(BATCH_IMAGE_MARKER_END)}|$)`,
+  "g",
+);
+const SECTION_END_STRIP_RE = new RegExp(`${escapeRe(BATCH_IMAGE_MARKER_END)}\\s*$`);
+
+/** Build the user-message text block for a (possibly batched) describer call.
+ *
+ * For a single image (count <= 1) this returns the same simple prompt the
+ * original per-image pipeline used (no markers), so single-image behaviour is
+ * unchanged. For count > 1 it instructs the vision model to emit one delimited
+ * `<<<IMAGE k>>> … <<<END>>>` section per image, in order, so the response can
+ * be split back into per-image descriptions by {@link parseBatchedDescriptions}.
+ *
+ * The user's turn prompt (if any) is folded in via {@link DEFAULT_USER_PROMPT_PREFIX}
+ * so every image in the batch is described in the context of the same request —
+ * one describer call covers the whole prompt's image set, dataloader-style,
+ * rather than spinning up one agent call per image. */
+export function batchUserPrompt(count: number, userPrompt: string, prefix: string): string {
+  const userLine = userPrompt && userPrompt.trim() ? `${prefix}${userPrompt}` : "";
+  if (count <= 1) {
+    return userLine || "Describe this image.";
+  }
+  return [
+    `Describe each of the ${count} images below exhaustively, in order. For image k (1 through ${count}), emit exactly:`,
+    "",
+    `${BATCH_IMAGE_MARKER_START} k>>>`,
+    "<your exhaustive description>",
+    BATCH_IMAGE_MARKER_END,
+    ...(userLine ? ["", userLine] : []),
+  ].join("\n");
+}
+
+/** Parse a batched vision-model response into one description per image, in order.
+ *
+ * Returns an array of length `count`; each slot is the trimmed description for
+ * image k (1-indexed → array index k-1), or `null` when that image's section is
+ * missing, empty, or unparseable. Callers treat `null` as "description
+ * unavailable" (graceful degradation) — one image failing to parse must not
+ * void the rest of the batch.
+ *
+ * For `count <= 1` the whole response is treated as the single image's
+ * description (a lone `<<<IMAGE 1>>> … <<<END>>>` wrapper is stripped if the
+ * model emitted one anyway), preserving the original single-image behaviour. */
+export function parseBatchedDescriptions(text: string, count: number): (string | null)[] {
+  const trimmed = (text ?? "").trim();
+  if (count <= 1) {
+    const m = SECTION_SINGLE_RE.exec(trimmed);
+    const body = (m ? m[1] : trimmed).trim();
+    return [body || null];
+  }
+  const out: (string | null)[] = new Array(count).fill(null);
+  let m: RegExpExecArray | null;
+  SECTION_MULTI_RE.lastIndex = 0;
+  while ((m = SECTION_MULTI_RE.exec(trimmed)) !== null) {
+    const idx = parseInt(m[1], 10) - 1;
+    const body = m[2].replace(SECTION_END_STRIP_RE, "").trim();
+    if (idx >= 0 && idx < count && !out[idx]) out[idx] = body || null;
+  }
+  return out;
+}
+
+/** Truncate (if configured) and wrap a raw description in the `[Image: …]`
+ *  placeholder envelope used by every insertion path. Centralises the wrap+
+ *  truncate logic shared by the read-tool and context injection paths so both
+ *  surfaces stay identical for the same image hash. */
+export function wrapDescription(description: string, cfg: VisionHandoffConfig): string {
+  const { text: final } =
+    cfg.maxDescriptionLines && cfg.maxDescriptionLines > 0
+      ? truncateDescription(description, cfg.maxDescriptionLines)
+      : { text: description };
+  return `${IMAGE_PLACEHOLDER_PREFIX}${final}${IMAGE_PLACEHOLDER_SUFFIX}`;
 }
 
 /** Outcome of {@link insertImageDescriptions}. */

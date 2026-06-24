@@ -26,20 +26,21 @@ The `pi-umans-provider` extension quietly solved this for GLM 5.1: a hardcoded "
 
 - **Pick any vision-capable model** from your registry via an interactive picker — OpenAI, Anthropic, Google, Ollama, or any custom provider pi knows about.
 - Your choice **persists** to `~/.pi/agent/extensions/pi-vision-handoff.json`.
-- For any model that doesn't declare image input (or any model you explicitly target), `pi-vision-handoff` describes the image with your chosen vision model and **inserts the description before the kept image** in the stored `read`-tool result — **before** pi-ai can strip the image for non-vision models. The image stays for kitty rendering; pi-ai later strips only the image block, leaving the description text for the model.
+- For any model that doesn't declare image input (or any model you explicitly target), `pi-vision-handoff` describes the image with your chosen vision model and swaps the image block for its description text at the **`context`** event — which fires *before* pi-ai's `downgradeUnsupportedImages` can strip image blocks for non-vision models. This covers every image source: pasted/attached images, `read`-tool results, and custom extension-injected messages. (Read-tool images additionally keep the description + image in the stored `tool_result` for kitty inline rendering and `/resume`.)
 - Works across all four image-block shapes pi uses — the three provider-transformed formats (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages) plus pi-ai's internal `{ type: "image", data, mimeType }` emitted by the `read` tool — detected by shape.
-- Descriptions are **cached per image hash** (LRU), so the swap is instant by the time the request fires.
+- Descriptions are **cached per image hash** (LRU) and produced **one batched vision call per image set** (dataloader-style: a prompt describing N images does not spin up N describer calls), so the swap is instant by the time the request fires.
 
 No `settings.json` touched. No per-provider glue. Pick a describer once and every text-only model you own can suddenly see.
 
 ## Features
 
 - **🎮 Interactive picker** — `/vision-handoff` opens a TUI listing every model, vision-capable ones first (👁), to choose your describer.
-- **🖼️ Read-tool hijack** — `read`-tool images are intercepted at `tool_result` time, before pi-ai can strip them for non-vision models. The kept image still renders inline (kitty); the description is inserted as a text block the text-only model consumes.
+- **🖼️ DataLoader-batched descriptions** — the `read` tools are `load()` callers: N parallel reads coalesce into ONE batched vision call (dispatched after the microtask cascade settles), awaited during the tool-result phase (free time) so the agent's next turn never blocks on the describer. Descriptions are ready before `context` fires, so the swap is a non-blocking cache hit.
+- **🧹 Hides pi's "model does not support images" note** — on read results the extension strips pi's `[Current model does not support images…]` note from the text block (it's misleading once the handoff delivers the image's content as text), while keeping the image block for kitty inline rendering and `/resume`.
 - **🔌 Provider-agnostic** — uses pi's own model execution machinery (`@earendil-works/pi-ai`'s `complete()`), so it works with any provider/configured model, including custom provider extensions.
 - **🧠 Automatic targets** — by default, handoff applies to *every* model that lacks native vision. Opt out with `/vision-handoff auto off`.
 - **🗂️ Explicit overrides** — force handoff for specific models (e.g. a weak vision model) with `/vision-handoff add`.
-- **⚡ Cache-warmed** — `before_agent_start` describes attached images the moment you submit, so the request is rarely delayed.
+- **⚡ Pre-warmed at paste-enter** — the moment you press enter, `before_agent_start` scans the prompt for pasted clipboard image temp-file paths (pi writes pasted images to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the path as text), reads them, and kicks off the ONE batched vision call concurrent with the agent's first response — so by the time the agent reads the files, they're already cache hits.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
 - **📊 Usage reporting** — every real describer call reports model + tokens (and Neuralwatt energy/cost when the vision model is a Neuralwatt model), via `pi.appendEntry` + a `vision-handoff:usage` event for live consumers.
 - **🔧 Tunable** — cap description length (`maxDescriptionLines`; unbounded by default, so `read`'s native `ctrl+o` collapse handles compactness) and cache size, in the config file.
@@ -133,49 +134,126 @@ pi -e ./vision-handoff.ts
 
 ## How It Works
 
-Read-tool images (the common case — paste a screenshot, `read` an image file):
-
-    read tool returns an image block
-      → tool_result (toolName === "read")
-          • fires BEFORE pi-ai's transformMessages can strip the image for
-            non-vision models (the strip would leave only a "(tool image
-            omitted)" placeholder — too late to describe)
-          • is this model a handoff target? (non-vision, or in handoffModels)
-          • for each {type:"image",...} block → describeImage() with your
-            chosen vision model
-              - complete() via pi-ai (resolves API key/headers/baseUrl)
-              - cached by sha256(mime + base64)
-          • AUGMENTS the stored result: inserts "[Image: <description>]" as a
-            text block BEFORE the kept image, returns {content} to pi
-          • the image stays in content → kitty renders it inline
-          • at provider time, pi-ai strips ONLY the image block for non-vision
-            models — the inserted description text passes through to the model
-
-User-attached images (pasted into the prompt, not read via a tool):
+The extension implements the **Facebook DataLoader pattern** for image
+descriptions. The `read` tools are the `load()` callers; a per-image cache
+memoizes promises; all `load()` calls in the same execution frame coalesce
+into ONE batched vision call, dispatched after the microtask cascade settles.
 
     → before_agent_start
-        • warms the description cache for attached images (fire-and-forget)
-    → before_provider_request
-        • walks the provider payload, swaps image blocks for "[Image: <desc>]"
-        • NOTE: for non-vision models, pi-ai strips image blocks BEFORE this
-          hook fires — so user-attached images on text-only models are not yet
-          described. Use the `read` tool on the image file instead, which routes
-          through the tool_result path above.
+        • captures this turn's user prompt (shared by every image description)
+        • binds turn context (vision model + abort signal) to the loader
+        • PRE-WARMS at paste-enter via the loader, two sources coalescing into
+          ONE batch:
+          1. attached image blocks (event.images) — vision-capable targets
+          2. pasted clipboard image FILE PATHS in the prompt text — the common
+             non-vision flow: pi writes each pasted image to
+             `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the PATH as text
+             at the cursor, so on a non-vision model they arrive as path tokens
+             in `event.prompt`, NOT as `event.images`. The extension scans the
+             prompt for those temp paths (confined to the OS temp dir — a
+             prompt can't trick it into reading arbitrary files), reads the
+             files synchronously (keeps all load() calls in one batch frame →
+             one vision call), and `loadDescription()`s them — so the vision
+             call starts the INSTANT you press enter, concurrent with the
+             agent's first response, not waiting for it to `read` the files
+    → read tool / tool_result   (PRIMARY injection point)
+        • pi runs `read` calls in parallel (Promise.all); each read's
+          tool_result handler calls `loadDescription(img)` for its image
+          blocks and AWAITS the shared batch
+        • DataLoader: all `load()` calls in the same microtask frame land in
+          ONE batch → ONE `complete()` vision call for the whole read set
+          (dispatched after the microtask cascade via enqueuePostPromiseJob:
+          `Promise.resolve().then(() => process.nextTick(dispatch))`)
+        • awaits the shared batch — runs the describer during the tool-result
+          phase (free time: the agent is just waiting for tool results), so
+          the batch is COMPLETE before `context` fires → `context` is a
+          non-blocking cache hit, not a cold miss on the critical path
+        • does NOT mutate the result: the image stays in storage for kitty
+          inline rendering and `/resume`; the image→text swap happens in the
+          `context` hook (on the cloned LLM-bound payload only)
+    → context   (FALLBACK + swap — fires before each LLM call)
+        • catches image blocks that didn't go through `read`'s tool_result —
+          user-attached images, custom extension-injected messages — and
+          swaps read images too (cache hits from the tool_result priming)
+        • `loadDescription()` is a cache hit (warmed above) or queues into the
+          loader's current batch; swaps images for text in the cloned LLM-bound
+          payload (`emitContext` does a `structuredClone`), leaving storage
+          intact for kitty inline rendering and `/resume`
 
-Result: the text-only model receives a vivid text description alongside the
-(now-stripped) image reference, and your turn proceeds normally — while the
-terminal still renders the image inline via kitty.
+Because the describer runs during the **tool-result phase** (before the
+agent's next turn), not during the `context` transform (the critical path
+right before the LLM call), the agent gets described text immediately when
+its turn starts — it never waits on the describer inline.
+
+### Batching: the DataLoader
+
+A single frame's image set is described with **one** vision-model call, not
+one per image. `loadDescription(img)` is synchronous: on a cache miss it
+pushes the image's key (hash) into the current batch and returns a memoized
+promise; on a cache hit it returns the existing (in-flight or resolved)
+promise. `enqueuePostPromiseJob` schedules dispatch after the microtask
+cascade settles, so every `load()` caller in the frame registers its key
+before the single vision call fires — exactly DataLoader's `getCurrentBatch`
++ `enqueuePostPromiseJob`. The batched call sends every uncached image in a
+single user message with per-image `<<<IMAGE k>>> … <<<END>>>` delimiters; the
+response is parsed back into per-image descriptions (keyed by
+`sha256(mime + base64)` in the per-image cache). If the vision model ignores
+the delimiter format and the batched response can't be split, each unparsed
+image falls back to its own single-image `complete()` call **in parallel**
+(no delimiters to cooperate with) — descriptions still arrive together. Only
+when a per-image call itself genuinely fails (auth, timeout, empty) does that
+image degrade to `[Image: description unavailable]`; one bad image never
+voids the rest.
+
+Because pi runs parallel `read` tool calls via `Promise.all` and fires the
+`tool_result` event inside that `Promise.all` (via `agent.afterToolCall` →
+`finalizeExecutedToolCall`), N parallel reads' `load()` calls share ONE
+microtask frame → ONE batch → ONE vision call, all resolving together.
+
+**Failures are never cached.**
+
+**Failures are never cached.** A genuine describer failure returns
+`[Image: description unavailable]` for that turn but is NOT written to the
+per-image cache, so the next turn re-attempts (and surfaces the real error
+via a `ctx.ui.notify` warning instead of serving a stuck placeholder). This
+avoids a transient failure poisoning the cache for the rest of the session.
+
+**Per-image-set warning.** The `context` hook fires before every LLM turn,
+and describer failures aren't cached — so without dedup the same broken
+vision model would re-warn every turn. Each distinct image is warned about
+at most once per session (tracked by image hash, reset on `/resume`/new
+session); subsequent turns for the same failing image degrade silently to
+the placeholder instead of spamming.
+
+**Timeout scales with batch size.** The describer generates an exhaustive
+multi-paragraph description per image, and the call is batched (N images →
+1 request). The timeout is `DESCRIBE_TIMEOUT_MS` (120s) plus a per-image
+budget (45s × (imageCount − 1)), so a 5-image batch isn't held to the same
+wall-clock budget as one image. A timeout surfaces as `describer timed out
+after <N>s` rather than a misleading `stopReason "aborted"`.
+
+**Aborts propagate.** The `context` hook runs in the foreground (pi awaits
+it before the LLM call), so a slow describer would also make aborting a turn
+slow — pi has to wait for the transform to return. The hook therefore wires
+the turn's abort signal (`ctx.signal`, the active run's `AbortController`)
+into the describer's `complete()` call, so a user cancel kills the in-flight
+vision request immediately. A deliberate abort is not warned about (it's
+not a vision-model failure) and the LLM-bound payload is left untouched since
+the turn is being torn down anyway.
 
 ### Image-block formats handled
 
-| Hook | Image block shape | Replacement |
-|------|-------------------|-------------|
-| `tool_result` (read) | `{ type: "image", data, mimeType }` (pi-ai internal) | description text block inserted **before** the kept image |
-| `before_provider_request` | `{ type: "image_url", image_url: { url: "data:…" } }` (OpenAI Chat Completions) | `{ type: "text", text }` |
-| `before_provider_request` | `{ type: "input_image", image_url: "data:…" }` (OpenAI Responses) | `{ type: "input_text", text }` |
-| `before_provider_request` | `{ type: "image", source: { type: "base64", media_type, data } }` (Anthropic Messages) | `{ type: "text", text }` |
+| Hook | Image block shape | Handling |
+|------|-------------------|----------|
+| `context` (all messages) | `{ type: "image", data, mimeType }` (pi-ai internal) | undescribed → replaced with description text; already-described → dropped |
+| `context` (all messages) | `{ type: "image_url", image_url: { url: "data:…" } }` (OpenAI Chat Completions) | detected by shape → replaced with `{ type: "text", text }` |
+| `context` (all messages) | `{ type: "input_image", image_url: "data:…" }` (OpenAI Responses) | detected by shape → replaced with `{ type: "input_text", text }` |
+| `context` (all messages) | `{ type: "image", source: { type: "base64", media_type, data } }` (Anthropic Messages) | detected by shape → replaced with `{ type: "text", text }` |
 
-The describer call itself goes through pi's normal model machinery (`complete()`), **not** the agent event loop — so it never re-triggers `before_provider_request` (no recursion).
+The describer call itself goes through pi's normal model machinery (`complete()`),
+**not** the agent event loop — so it never re-triggers `context` (no recursion).
+The `read` tool result keeps its image block untouched (kitty inline + `/resume`);
+only the `context`-cloned LLM-bound payload has images swapped for text.
 
 ### Usage reporting
 
@@ -194,19 +272,24 @@ Record shape:
   model: string, provider: string,
   responseModel?: string, responseId?: string,
   usage: Usage,                 // { input, output, cacheRead, cacheWrite, totalTokens, cost }
+  imageHash: string,            // representative (first) member of the batch; sha256(mime + base64), first 32 hex chars
+  imageHashes?: string[],        // present only for batched calls (length > 1): every image the call covered
+  model: string, provider: string,
+  responseModel?: string, responseId?: string,
+  usage: Usage,                 // { input, output, cacheRead, cacheWrite, totalTokens, cost }
   // Present ONLY when Neuralwatt SSE energy comments were captured:
   energyJoules?: number, costUsd?: number,
   energyRaw?: object, mcrSessionRaw?: object, costRaw?: object,
 }
 ```
 
-Because `before_agent_start` fires several `describeImage()` calls fire-and-forget, the fetch interception is **refcounted** (installed only while ≥1 describe is in flight) and uses `AsyncLocalStorage` to route each teed response body to the describe call that issued it — so concurrent describes each attribute their own energy correctly without clobbering `globalThis.fetch`. When the vision model is a Neuralwatt model, `pi-neuralwatt-provider`'s own `streamNeuralwatt` tee nests on top and restores back to this interceptor; both tees read the same comment lines independently (the accepted duplication for easy filtering).
+One record is emitted per **real** describer call (a batched call describing several images still emits a single record, with `imageHashes` listing every member so consumers can attribute the call's tokens/energy per image without double-counting). Because `before_agent_start` fires a batched describe fire-and-forget, the fetch interception is **refcounted** (installed only while ≥1 describe is in flight) and uses `AsyncLocalStorage` to route each teed response body to the describe call that issued it — so concurrent describes each attribute their own energy correctly without clobbering `globalThis.fetch`. When the vision model is a Neuralwatt model, `pi-neuralwatt-provider`'s own `streamNeuralwatt` tee nests on top and restores back to this interceptor; both tees read the same comment lines independently (the accepted duplication for easy filtering).
 
 ## Comparison with Alternatives
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| **pi-vision-handoff** (this) | Provider-agnostic; pick any describer; automatic for text-only models; cached; survives across providers | Adds one extra model call per unique image |
+| **pi-vision-handoff** (this) | Provider-agnostic; pick any describer; automatic for text-only models; cached; batched (one call per image set); survives across providers | Adds one extra model call per image set per turn |
 | Native vision on every model | Zero overhead | Not all models support it; you may be forced off your preferred coding model |
 | Manually describing images | No extension | Tedious; lossy; kills the "paste a screenshot" workflow |
 | The original `pi-umans-provider` handoff | Battle-tested | Hardcoded to `umans-flash` + UMANS models only |
