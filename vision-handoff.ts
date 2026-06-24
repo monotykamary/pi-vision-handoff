@@ -33,6 +33,7 @@ import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-a
 import {
   extractImageFromBlock,
   formatModelRef,
+  isThinkingLevel,
   isVisionModel,
   NON_VISION_IMAGE_NOTE,
   parseModelRef,
@@ -412,7 +413,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("vision-handoff", {
     description: HANDOFF_COMMAND_DESCRIPTION,
     getArgumentCompletions(prefix: string) {
-      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "add", "remove", "clear", "help"];
+      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "add", "remove", "clear", "help"];
       const matches = subcommands.filter((s) => s.startsWith(prefix));
       return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
     },
@@ -444,6 +445,8 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "  /vision-handoff enable         Enable vision handoff",
         "  /vision-handoff disable        Disable vision handoff (keeps configured model)",
         "  /vision-handoff auto <on|off>  Toggle automatic handoff for all non-vision models",
+        "  /vision-handoff thinking <off|minimal|low|medium|high|xhigh>",
+        "                               Set the vision describer's thinking effort (off = disabled)",
         "  /vision-handoff add <p/id>     Force handoff for an extra model",
         "  /vision-handoff remove <p/id>  Stop forcing handoff for a model",
         "  /vision-handoff clear          Clear the configured vision model",
@@ -486,6 +489,11 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
       (c) => ({ ...c, autoHandoff: on }),
       `Automatic handoff for non-vision models ${on ? "on" : "off"}.`,
     );
+    return;
+  }
+
+  if (subcommand === "thinking") {
+    handleThinkingSubcommand(ctx, rest);
     return;
   }
 
@@ -582,6 +590,38 @@ function updateConfig(
   ctx.ui.notify(`${message} (config: ${path})`, "info");
 }
 
+/** Resolve a `/vision-handoff thinking <level>` argument into a
+ *  `(thinking, thinkingLevel)` pair. `off` disables thinking; any of the
+ *  {@link THINKING_LEVELS} enables it at that effort. */
+function handleThinkingSubcommand(ctx: ExtensionCommandContext, rest: string): void {
+  const arg = rest.trim().toLowerCase();
+  if (!arg) {
+    ctx.ui.notify(
+      `Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}.\n` +
+        `Usage: /vision-handoff thinking <off|minimal|low|medium|high|xhigh>`,
+      "info",
+    );
+    return;
+  }
+  if (arg === "off") {
+    updateConfig(ctx, (c) => ({ ...c, thinking: false }), "Vision describer thinking off.");
+    return;
+  }
+  if (!isThinkingLevel(arg)) {
+    ctx.ui.notify(
+      `Unknown thinking level: "${arg}". Use off, minimal, low, medium, high, or xhigh.`,
+      "error",
+    );
+    return;
+  }
+  const level = arg;
+  updateConfig(
+    ctx,
+    (c) => ({ ...c, thinking: true, thinkingLevel: level }),
+    `Vision describer thinking on (${level}).`,
+  );
+}
+
 async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify("/vision-handoff requires interactive mode.", "error");
@@ -590,10 +630,17 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
 
   const allModels = ctx.modelRegistry
     .getAll()
-    .map((m) => ({ provider: m.provider, id: m.id, name: m.name, input: m.input }));
+    .map((m) => ({ provider: m.provider, id: m.id, name: m.name, input: m.input, reasoning: m.reasoning }));
 
   const result = await ctx.ui.custom<VisionModelSelectorResult>((tui, theme, _kb, done) => {
-    const selector = new VisionModelSelectorComponent(theme, allModels, config.visionModel, (r) => done(r));
+    const selector = new VisionModelSelectorComponent(
+      theme,
+      allModels,
+      config.visionModel,
+      config.thinking,
+      config.thinkingLevel,
+      (r) => done(r),
+    );
     return {
       render(width: number) {
         return selector.render(width);
@@ -614,7 +661,18 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   }
 
   const ref = result.ref;
-  updateConfig(ctx, (c) => ({ ...c, visionModel: ref }), ref ? `Vision model set to ${ref}` : "Vision model cleared");
+  const thinking = result.thinking;
+  const thinkingLevel = result.thinkingLevel;
+  updateConfig(
+    ctx,
+    (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel }),
+    ref ? `Vision model set to ${ref}` : "Vision model cleared",
+  );
+  ctx.ui.notify(
+    `Thinking: ${thinking ? `on (${thinkingLevel})` : "off"}` +
+      (thinking && ref ? " — applies only if the vision model supports reasoning" : ""),
+    "info",
+  );
   if (!ref) {
     ctx.ui.notify("Handoff is inactive until you pick a vision model.", "warning");
   }
@@ -626,6 +684,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
   lines.push(`Vision model: ${config.visionModel ?? "(none — pick one with /vision-handoff)"}`);
   lines.push(`Auto handoff (non-vision models): ${config.autoHandoff ? "on" : "off"}`);
   lines.push(`Handoff targets (explicit): ${config.handoffModels.length ? config.handoffModels.join(", ") : "(none)"}`);
+  lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
   lines.push(`maxTokens: ${config.maxTokens ?? "unbounded"} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
 
   const model = ctx.model;

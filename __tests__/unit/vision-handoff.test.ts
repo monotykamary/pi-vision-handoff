@@ -131,6 +131,29 @@ describe("normalizeConfig", () => {
     expect(normalizeConfig({ maxDescriptionLines: 7 }).maxDescriptionLines).toBe(7);
   });
 
+  it("thinking defaults to off with a medium level", () => {
+    expect(DEFAULT_CONFIG.thinking).toBe(false);
+    expect(DEFAULT_CONFIG.thinkingLevel).toBe("medium");
+    expect(normalizeConfig({}).thinking).toBe(false);
+    expect(normalizeConfig({}).thinkingLevel).toBe("medium");
+  });
+
+  it("thinking accepts a boolean on/off and a valid level", () => {
+    const cfg = normalizeConfig({ thinking: true, thinkingLevel: "high" });
+    expect(cfg.thinking).toBe(true);
+    expect(cfg.thinkingLevel).toBe("high");
+  });
+
+  it("thinking rejects an unknown level and falls back to the default", () => {
+    expect(normalizeConfig({ thinking: true, thinkingLevel: "extreme" }).thinkingLevel).toBe("medium");
+    expect(normalizeConfig({ thinkingLevel: 5 }).thinkingLevel).toBe("medium");
+  });
+
+  it("thinking ignores non-boolean on/off", () => {
+    expect(normalizeConfig({ thinking: "yes" }).thinking).toBe(false);
+    expect(normalizeConfig({ thinking: 1 }).thinking).toBe(false);
+  });
+
   it("rejects negative / non-finite maxDescriptionLines", () => {
     expect(normalizeConfig({ maxDescriptionLines: -3 }).maxDescriptionLines).toBe(
       DEFAULT_CONFIG.maxDescriptionLines,

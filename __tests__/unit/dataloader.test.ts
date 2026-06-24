@@ -31,6 +31,8 @@ function makeLoader(overrides: Partial<LoaderDeps> = {}): DescriptionLoader {
     maxTokens: undefined,
     cacheMax: 50,
     maxDescriptionLines: 0,
+    thinking: false,
+    thinkingLevel: "medium",
   };
   const deps: LoaderDeps = {
     getConfig: () => cfg,

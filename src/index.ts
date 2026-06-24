@@ -5,7 +5,7 @@
  * convention pi-model-sort uses for picker-backed extensions.
  */
 
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -56,6 +56,26 @@ export function markDescriptionTruncated(text: string): string {
 
 /** Default vision cache size (number of described images kept in memory per session). */
 export const DEFAULT_CACHE_MAX = 50;
+
+/** The pi thinking levels, ordered from lightest to deepest reasoning.
+ *  Mirrors `@earendil-works/pi-ai`'s `ThinkingLevel`; "off" is handled
+ *  separately via {@link VisionHandoffConfig.thinking} (a boolean on/off
+ *  switch) so the level persists across toggles. */
+export const THINKING_LEVELS: readonly ThinkingLevel[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
+
+/** Default thinking effort for the vision describer when thinking is enabled. */
+export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
+
+/** Whether `level` is one of the supported {@link ThinkingLevel} values. */
+export function isThinkingLevel(level: unknown): level is ThinkingLevel {
+  return typeof level === "string" && (THINKING_LEVELS as readonly string[]).includes(level);
+}
 
 /** Per-description request timeout. Generous because the describer generates an
  *  exhaustive multi-paragraph description per image; a single image commonly
@@ -135,6 +155,16 @@ export interface VisionHandoffConfig {
   prompt?: string;
   /** Override the user-prompt prefix (defaults to DEFAULT_USER_PROMPT_PREFIX). */
   userPromptPrefix?: string;
+  /** Whether the vision describer should reason (think) before describing.
+   *  Off by default — describing images is a perception task, not a reasoning
+   *  one, and thinking adds latency + cost. When on, the level below is sent
+   *  to the vision model via pi-ai's `reasoning` option (only honoured when
+   *  the configured vision model declares `reasoning: true`). */
+  thinking: boolean;
+  /** Thinking effort for the describer when {@link thinking} is on. One of
+   *  {@link THINKING_LEVELS}. Ignored when {@link thinking} is off or the
+   *  vision model lacks reasoning support. */
+  thinkingLevel: ThinkingLevel;
 }
 
 export const DEFAULT_CONFIG: VisionHandoffConfig = {
@@ -145,6 +175,8 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   maxTokens: undefined,
   cacheMax: DEFAULT_CACHE_MAX,
   maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
+  thinking: false,
+  thinkingLevel: DEFAULT_THINKING_LEVEL,
 };
 
 /** Parse a "provider/id" reference. Returns null if malformed. */
@@ -207,6 +239,9 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
   }
   if (typeof obj.prompt === "string" && obj.prompt.trim()) base.prompt = obj.prompt;
   if (typeof obj.userPromptPrefix === "string") base.userPromptPrefix = obj.userPromptPrefix;
+
+  if (typeof obj.thinking === "boolean") base.thinking = obj.thinking;
+  if (isThinkingLevel(obj.thinkingLevel)) base.thinkingLevel = obj.thinkingLevel;
 
   return base;
 }

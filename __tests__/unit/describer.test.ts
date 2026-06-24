@@ -35,6 +35,8 @@ const cfg: VisionHandoffConfig = {
   maxTokens: undefined,
   cacheMax: 50,
   maxDescriptionLines: 0,
+  thinking: false,
+  thinkingLevel: "medium",
 };
 
 const modelRegistry = {
@@ -99,6 +101,45 @@ describe("describeSingle stopReason handling", () => {
   });
 });
 
+describe("thinking (reasoning) passthrough", () => {
+  const reasoningModel = { ...visionModel, reasoning: true } as any;
+  const nonReasoningModel = { ...visionModel, reasoning: false } as any;
+
+  beforeEach(() => complete.mockReset());
+
+  it("omits reasoning when thinking is disabled in config", async () => {
+    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    await describeSingle(img("AAA"), "", reasoningModel, modelRegistry, { ...cfg, thinking: false }, makeDeps());
+    expect(complete.mock.calls[0][2].reasoning).toBeUndefined();
+  });
+
+  it("passes the configured thinkingLevel when thinking is on and the model reasons", async () => {
+    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    await describeSingle(
+      img("AAA"),
+      "",
+      reasoningModel,
+      modelRegistry,
+      { ...cfg, thinking: true, thinkingLevel: "high" },
+      makeDeps(),
+    );
+    expect(complete.mock.calls[0][2].reasoning).toBe("high");
+  });
+
+  it("omits reasoning when thinking is on but the model has no reasoning support", async () => {
+    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    await describeSingle(
+      img("AAA"),
+      "",
+      nonReasoningModel,
+      modelRegistry,
+      { ...cfg, thinking: true, thinkingLevel: "high" },
+      makeDeps(),
+    );
+    expect(complete.mock.calls[0][2].reasoning).toBeUndefined();
+  });
+});
+
 describe("resolveMaxTokens", () => {
   const baseCfg: VisionHandoffConfig = {
     enabled: true,
@@ -108,6 +149,8 @@ describe("resolveMaxTokens", () => {
     maxTokens: undefined,
     cacheMax: 50,
     maxDescriptionLines: 0,
+    thinking: false,
+    thinkingLevel: "medium",
   };
   const model = (maxTokens: number, contextWindow: number) =>
     ({ provider: "p", id: "id", maxTokens, contextWindow }) as any;

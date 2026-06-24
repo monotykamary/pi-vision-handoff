@@ -18,7 +18,7 @@
  * abort listener.
  */
 
-import type { Api, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Message, Model, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
@@ -76,6 +76,26 @@ export function resolveMaxTokens(
   return Math.max(1, Math.min(requested, cap));
 }
 
+/** Resolve the `reasoning` (thinking) level to pass to `complete()`, or
+ *  `undefined` to leave thinking off.
+ *
+ *  - Returns `undefined` when thinking is disabled in config.
+ *  - Returns `undefined` when the vision model doesn't declare reasoning
+ *    support (`model.reasoning === false`) — sending a `reasoning` level to a
+ *    non-reasoning model would be ignored at best and rejected at worst.
+ *  - Otherwise returns the configured {@link VisionHandoffConfig.thinkingLevel}.
+ *
+ *  Mirrors pi core's `createSummarizationOptions` guard so the describer's
+ *  thinking behaviour matches the rest of pi. */
+export function resolveReasoning(
+  cfg: VisionHandoffConfig,
+  visionModel: Model<Api>,
+): ThinkingLevel | undefined {
+  if (!cfg.thinking) return undefined;
+  if (!visionModel.reasoning) return undefined;
+  return cfg.thinkingLevel;
+}
+
 /** Dependencies the describer can't own itself (held by the engine). */
 export interface DescriberDeps {
   /** Report a usage+energy record for one real describer call (cache hits emit none). */
@@ -126,6 +146,7 @@ export async function runBatch(
 
   const timeoutMs = describeTimeoutMs(misses.length);
   const maxTokens = resolveMaxTokens(cfg, visionModel);
+  const reasoning = resolveReasoning(cfg, visionModel);
   const controller = new AbortController();
   let timedOut = false;
   using fetchGuard = fetchInterceptorGuard();
@@ -141,7 +162,7 @@ export async function runBatch(
       complete(
         visionModel,
         { systemPrompt, messages: [userMessage] },
-        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens },
+        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens, reasoning },
       ),
     );
     const capture = await readCapture(describeCtx);
@@ -239,6 +260,7 @@ export async function describeSingle(
   const userMessage: Message = { role: "user", content, timestamp: Date.now() };
   const timeoutMs = describeTimeoutMs(1);
   const maxTokens = resolveMaxTokens(cfg, visionModel);
+  const reasoning = resolveReasoning(cfg, visionModel);
   const controller = new AbortController();
   let timedOut = false;
   using fetchGuard = fetchInterceptorGuard();
@@ -254,7 +276,7 @@ export async function describeSingle(
       complete(
         visionModel,
         { systemPrompt, messages: [userMessage] },
-        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens },
+        { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens, reasoning },
       ),
     );
     const capture = await readCapture(describeCtx);
