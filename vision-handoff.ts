@@ -28,7 +28,7 @@
 
 import crypto from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { complete } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { Api, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai";
 import {
   DEFAULT_USER_PROMPT_PREFIX,
