@@ -10,6 +10,8 @@ _Describe images with a vision model you pick, then feed the text to models that
 [![npm](https://img.shields.io/npm/v/pi-vision-handoff)](https://www.npmjs.com/package/pi-vision-handoff)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
+<img src="https://raw.githubusercontent.com/monotykamary/pi-vision-handoff/main/assets/vision-handoff.jpg" alt="Vision Handoff picker — an interactive TUI listing every model, vision-capable ones marked with an eye, to choose the describer for text-only models" width="820">
+
 </div>
 
 ---
