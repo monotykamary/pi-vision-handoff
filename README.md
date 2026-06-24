@@ -308,15 +308,22 @@ pnpm lint:dead     # Dead code detection (knip)
 
 ```
 .
-├── vision-handoff.ts            # Main extension: hooks, command, describer
+├── vision-handoff.ts            # Wiring layer: pi hooks, /vision-handoff command
 ├── src/
-│   ├── index.ts                  # Config schema, read/write, image-block helpers (barrel)
+│   ├── index.ts                  # Config schema, read/write, image-block helpers, batching (barrel)
+│   ├── dataloader.ts              # DescriptionLoader — DataLoader-batched descriptions (Disposable)
+│   ├── describer.ts              # Vision describer calls (runBatch / describeSingle) with `using` resource guards
+│   ├── image.ts                  # Image hashing, MIME sniffing, clipboard-path reading
+│   ├── dispose.ts                 # `Disposable` guard factories for `using` (fetch interceptor, timer, abort wire)
 │   ├── usage.ts                  # Describer usage + Neuralwatt energy capture, fetch interceptor
 │   └── vision-model-selector.ts  # Interactive picker TUI component
 ├── __tests__/unit/
 │   ├── config-dir.test.ts        # Ensures getAgentDir() usage
 │   ├── usage.test.ts             # Energy parsing, usage records, concurrency-safe fetch routing
-│   └── vision-handoff.test.ts    # Config, refs, image-block extraction, insertion, truncation, round-trip
+│   ├── vision-handoff.test.ts    # Config, refs, image-block extraction, insertion, truncation, round-trip
+│   ├── dataloader.test.ts        # Batch coalescing, memoization, failure eviction, Disposable reset
+│   ├── image.test.ts             # MIME sniffing, clipboard-path confinement, file reading
+│   └── dispose.test.ts           # `using` guards: fetch refcount, timeout, abort-wire propagation
 ├── package.json
 ├── tsconfig.json
 ├── knip.json
