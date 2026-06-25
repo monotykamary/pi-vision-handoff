@@ -210,7 +210,8 @@ export default function (pi: ExtensionAPI) {
     //
     // Both sources flow through the same loader: `load()` is synchronous and
     // memoized, so all images in this frame (attached + clipboard-path)
-    // coalesce into ONE batch dispatched after the microtask cascade.
+    // coalesce into ONE batch dispatched via `setImmediate` after the
+    // microtask cascade settles.
     for (const image of event.images ?? []) {
       if (!image || image.type !== "image" || !image.data) continue;
       loader.loadDescription({ data: image.data, mimeType: image.mimeType || "image/png" }).catch(() => {});
@@ -244,12 +245,14 @@ export default function (pi: ExtensionAPI) {
   // When the agent reads image files, this fires for each read result. It
   // calls the loader's `loadDescription(img)` for every image block and
   // AWAITS the shared batch — so N parallel reads (pi runs `read` via
-  // Promise.all) coalesce into ONE batched vision call (DataLoader: all
-  // load() calls in the same microtask frame share one batch, dispatched
-  // after the cascade settles) and all resolve together. The descriptions
-  // replace the image blocks in the returned `content`, so by the time the
-  // agent's next turn starts the tool results already carry text — the
-  // agent never sees raw image blocks it can't process.
+  // Promise.all) coalesce into ONE batched vision call: pi fires each read's
+  // `tool_result` as its I/O completes (poll phase), and the loader's
+  // `setImmediate` dispatch defers to the check phase AFTER the whole poll
+  // iteration, so reads completing together land in ONE batch and all resolve
+  // together. The descriptions replace the image blocks in the returned
+  // `content`, so by the time the agent's next turn starts the tool results
+  // already carry text — the agent never sees raw image blocks it can't
+  // process.
   //
   // Why block here and not in `context`: the tool-result phase is free time
   // (the agent is just waiting for tool results), so running the describer
@@ -277,9 +280,13 @@ export default function (pi: ExtensionAPI) {
     }
 
     // load() each image — synchronous calls that push into the current batch
-    // and return memoized promises — then await them all. Parallel reads'
-    // load() calls land in the SAME batch (same microtask frame), so this is
-    // ONE vision call for the whole read set, not N. Awaiting here runs the
+    // and return memoized promises — then await them all. pi fires each read's
+    // `tool_result` event as that read's I/O completes (poll phase); the
+    // loader's `setImmediate` dispatch defers to the check phase, AFTER the
+    // whole poll iteration, so reads completing together (the common case for
+    // cached local files) land in ONE batch — ONE vision call for the whole
+    // read set, not N. Reads completing in separate iterations get separate
+    // calls, but always in parallel, never sequential. Awaiting here runs the
     // describer during the tool-result phase (free time — the agent is just
     // waiting for tool results), so the batch is COMPLETE before `context`
     // fires, making `context` a non-blocking cache hit instead of a cold miss

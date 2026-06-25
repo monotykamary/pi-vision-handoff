@@ -20,7 +20,10 @@ import type { ExtractedImage, VisionHandoffConfig } from "../../src/index.js";
 const img = (data: string, mimeType = "image/png"): ExtractedImage => ({ data, mimeType });
 const hashOf = (e: ExtractedImage) => imageHash(e.mimeType, e.data);
 
-function makeLoader(overrides: Partial<LoaderDeps> = {}): DescriptionLoader {
+function makeLoader(
+  overrides: Partial<LoaderDeps> = {},
+  cfgOverrides: Partial<VisionHandoffConfig> = {},
+): DescriptionLoader {
   const setLastError = vi.fn();
   const reportUsage = vi.fn();
   const cfg: VisionHandoffConfig = {
@@ -33,6 +36,7 @@ function makeLoader(overrides: Partial<LoaderDeps> = {}): DescriptionLoader {
     maxDescriptionLines: 0,
     thinking: false,
     thinkingLevel: "medium",
+    ...cfgOverrides,
   };
   const deps: LoaderDeps = {
     getConfig: () => cfg,
@@ -125,5 +129,58 @@ describe("DescriptionLoader batching", () => {
     loader.bindTurnContext({ modelRegistry: {} as any });
     const out = await loader.loadDescription(img("BBB"));
     expect(out).not.toBe(UNAVAILABLE);
+  });
+
+  it("coalesces loads issued from separate event-loop callbacks in the same phase (cross-IO batching)", async () => {
+    // Two setImmediate callbacks run in the same check phase. The loader's
+    // dispatch is itself a setImmediate scheduled DURING that phase, so it
+    // runs in the NEXT check phase — after both loads have landed in the
+    // batch. Under process.nextTick, dispatch would drain between the two
+    // callbacks and split them into two single-image calls.
+    const loader = makeLoader();
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    const a = img("AAA");
+    const b = img("BBB");
+
+    const [da, db] = await new Promise<[string, string]>((resolve) => {
+      let pa!: Promise<string>;
+      let pb!: Promise<string>;
+      setImmediate(() => {
+        pa = loader.loadDescription(a);
+      });
+      setImmediate(() => {
+        pb = loader.loadDescription(b);
+      });
+      setImmediate(() => {
+        Promise.all([pa, pb]).then(resolve);
+      });
+    });
+
+    expect(runBatch).toHaveBeenCalledTimes(1);
+    expect(da).toBe(`[Image: desc-for-${hashOf(a)}]`);
+    expect(db).toBe(`[Image: desc-for-${hashOf(b)}]`);
+  });
+
+  it("resolves EVERY callback when a duplicate load pushes a second callback (no hang)", async () => {
+    // cacheMax=1 forces a mid-frame eviction: load A, load B (evicts A), then
+    // load A again. A's first cache entry is gone, so the third load can't
+    // short-circuit on the cache and pushes a SECOND callback for A into the
+    // same batch (callbacks.length=3, keys.length=2). Dispatch must resolve
+    // all three by hash — a key-indexed loop would skip the duplicate and hang.
+    const loader = makeLoader({}, { cacheMax: 1 });
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    const a = img("AAA");
+    const b = img("BBB");
+
+    const pa = loader.loadDescription(a);
+    const pb = loader.loadDescription(b);
+    const pa2 = loader.loadDescription(a); // duplicate after A was evicted
+    const [da, db, da2] = await Promise.all([pa, pb, pa2]);
+
+    expect(runBatch).toHaveBeenCalledTimes(1);
+    expect(runBatch.mock.calls[0][0]).toHaveLength(2); // A and B, deduped
+    expect(da).toBe(`[Image: desc-for-${hashOf(a)}]`);
+    expect(db).toBe(`[Image: desc-for-${hashOf(b)}]`);
+    expect(da2).toBe(`[Image: desc-for-${hashOf(a)}]`); // duplicate resolved, not hung
   });
 });

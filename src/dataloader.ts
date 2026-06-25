@@ -4,19 +4,23 @@
  * `loadDescription(img)` returns a memoized Promise for the description and
  * pushes the image's key (hash) into the CURRENT batch. All `load()` calls in
  * the same execution frame (+ its microtask cascade) coalesce into ONE batch
- * object. Dispatch is scheduled after the microtask queue settles (via
- * `enqueuePostPromiseJob`), so every load in the frame lands in the single
- * batch before the ONE vision call fires. Each load()'s promise then resolves
- * with its description.
+ * object. Dispatch is scheduled via `setImmediate` (see `enqueuePostPromiseJob`),
+ * so every load in the frame — and every load from a separate I/O callback in
+ * the same poll iteration — lands in the single batch before the ONE vision
+ * call fires. Each load()'s promise then resolves with its description.
  *
  * Mapping: the `read` tools are the `load()` callers. Their `tool_result`
- * handler awaits the shared batch — so N parallel reads (pi runs `read` via
- * `Promise.all`) block on the SAME single vision call and all resolve together,
- * the descriptions landing in the tool results BEFORE the agent's next turn.
- * The agent's tool-result wait is free time, so this adds zero latency to the
- * critical path. `context` then sees text-described tool results (no image
- * blocks to swap); any remaining images (user-attached, custom-injected) are
- * cache hits.
+ * handler awaits the shared batch — so N parallel reads coalesce into the SAME
+ * single vision call and all resolve together, the descriptions landing in the
+ * tool results BEFORE the agent's next turn. pi fires each read's `tool_result`
+ * as that read's I/O completes (poll phase); the loader's `setImmediate`
+ * dispatch defers to the check phase, AFTER the whole poll iteration, so reads
+ * completing together (the common case for cached local files) land in ONE
+ * batch — and reads completing in separate iterations get separate calls, but
+ * always in parallel, never sequential. The agent's tool-result wait is free
+ * time, so this adds zero latency to the critical path. `context` then sees
+ * text-described tool results (no image blocks to swap); any remaining images
+ * (user-attached, custom-injected) are cache hits.
  *
  * All mutable state (batch, cache, turn context) lives on the instance — no
  * module-level globals — and the class implements `Disposable` so a `using`
@@ -43,7 +47,12 @@ export const UNAVAILABLE = `${IMAGE_PLACEHOLDER_PREFIX}description unavailable${
 interface DescriptionBatch {
   keys: string[];
   imgs: ExtractedImage[];
-  callbacks: { resolve: (v: string) => void; reject: (e: Error) => void }[];
+  /** One per `loadDescription()` call. A duplicate load (same hash, but its
+   *  first cache entry was evicted mid-frame so it couldn't short-circuit on
+   *  the cache) pushes a second callback for an existing key — so
+   *  `callbacks.length` can exceed `keys.length`. `dispatchBatch` resolves by
+   *  hash so every callback is reached. */
+  callbacks: { hash: string; resolve: (v: string) => void; reject: (e: Error) => void }[];
 }
 
 /** Engine-provided resolver for the configured vision model. */
@@ -59,16 +68,21 @@ export interface LoaderDeps extends DescriberDeps {
   resolveVisionModel: VisionModelResolver;
 }
 
-const resolvedMicrotask = Promise.resolve();
-
-/** Defer `fn` until after the current microtask cascade settles, so every
- *  `loadDescription()` in the same frame coalesces into one batch before the
- *  single vision call fires. Mirrors DataLoader's enqueuePostPromiseJob: a
- *  Promise Job enqueues a global Job (process.nextTick), guaranteeing dispatch
- *  runs after "PromiseJobs" ends — after all `load()` callers in the frame
- *  have registered their keys. */
+/** Defer `fn` to the next check phase (`setImmediate`), so every
+ *  `loadDescription()` — whether called from sync code, a microtask cascade,
+ *  or a separate I/O callback in the same poll iteration — coalesces into one
+ *  batch before the single vision call fires.
+ *
+ *  Why `setImmediate` and not DataLoader's classic `process.nextTick`:
+ *  nextTick drains between I/O callbacks in the poll phase, so dispatch would
+ *  fire after the first parallel `read`'s `tool_result` but before the
+ *  second's — splitting N reads into N single-image calls. `setImmediate` runs
+ *  in the check phase, AFTER the whole poll phase, so all `tool_result`
+ *  handlers that fire in one poll iteration land in ONE batch. The check phase
+ *  also runs after the microtask queue drains, so loads issued from a `.then`
+ *  cascade (e.g. the clipboard pre-warm) still coalesce. */
 function enqueuePostPromiseJob(fn: () => void): void {
-  resolvedMicrotask.then(() => process.nextTick(fn));
+  setImmediate(fn);
 }
 
 export class DescriptionLoader implements Disposable {
@@ -119,12 +133,14 @@ export class DescriptionLoader implements Disposable {
       batch.imgs.push(img);
       idx = batch.keys.length - 1;
     } else {
-      // Same image loaded twice in the frame — share one cache slot, but give
-      // this caller its own promise.
+      // Same image loaded twice in the frame (the first load's cache entry was
+      // evicted mid-frame, else the second load would have short-circuited on
+      // the cache). Share the one key/image slot but give this caller its own
+      // promise — dispatch resolves it by hash alongside the first caller's.
       batch.imgs[idx] = img;
     }
     const promise = new Promise<string>((resolve, reject) => {
-      batch.callbacks.push({ resolve, reject });
+      batch.callbacks.push({ hash, resolve, reject });
     });
     const cfg = this.deps.getConfig();
     if (this.cache.size >= cfg.cacheMax) {
@@ -161,7 +177,14 @@ export class DescriptionLoader implements Disposable {
   /** Dispatch the current batch: ONE batched `runBatch` vision call for every
    *  key collected this frame, then resolve each load()'s promise with its
    *  description (or {@link UNAVAILABLE} on failure). Failures are evicted from
-   *  the cache so the next turn re-attempts. */
+   *  the cache so the next turn re-attempts.
+   *
+   *  Results are resolved BY HASH and fanned out to EVERY callback: a batch can
+   *  hold more callbacks than keys when the same image was loaded twice in one
+   *  frame (its first cache entry was evicted mid-frame, so the second load
+   *  pushed a second callback for the same hash). Indexing callbacks by key
+   *  would skip those duplicates and hang their promises; iterating callbacks
+   *  and looking up each one's hash fans the one result to all of them. */
   private async dispatchBatch(): Promise<void> {
     this.dispatchScheduled = false;
     const batch = this.batch;
@@ -172,10 +195,8 @@ export class DescriptionLoader implements Disposable {
       return;
     }
     if (this.turnSignal?.aborted) {
-      for (let i = 0; i < batch.keys.length; i++) {
-        this.cache.delete(batch.keys[i]);
-        batch.callbacks[i].resolve(UNAVAILABLE);
-      }
+      for (const key of batch.keys) this.cache.delete(key);
+      for (const cb of batch.callbacks) cb.resolve(UNAVAILABLE);
       return;
     }
     this.deps.setLastError(null); // clear before a fresh attempt
@@ -190,19 +211,27 @@ export class DescriptionLoader implements Disposable {
       this.deps,
       this.turnSignal,
     );
+    // Build per-hash results, then fan them out to every callback. This reaches
+    // duplicate-hash callbacks that a key-indexed loop would have skipped (and
+    // left hanging).
+    const results = new Map<string, string>();
     for (let i = 0; i < batch.keys.length; i++) {
-      const raw = parsed.get(batch.keys[i]);
+      const key = batch.keys[i];
+      const raw = parsed.get(key);
       if (raw) {
         const final = wrapDescription(raw, cfg);
-        this.cache.set(batch.keys[i], Promise.resolve(final));
-        batch.callbacks[i].resolve(final);
+        results.set(key, final);
+        // Cache the resolved value so later loads (this frame or next) hit.
+        this.cache.set(key, Promise.resolve(final));
       } else {
         // Genuine failure — do NOT cache; next turn re-attempts (and surfaces
         // the real error). Resolve (not reject) with UNAVAILABLE to match the
         // graceful-degradation contract and avoid unhandled rejections.
-        this.cache.delete(batch.keys[i]);
-        batch.callbacks[i].resolve(UNAVAILABLE);
+        this.cache.delete(key);
       }
+    }
+    for (const cb of batch.callbacks) {
+      cb.resolve(results.get(cb.hash) ?? UNAVAILABLE);
     }
   }
 }

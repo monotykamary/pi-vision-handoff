@@ -37,7 +37,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 ## Features
 
 - **🎮 Interactive picker** — `/vision-handoff` opens a TUI listing every model, vision-capable ones first (👁), to choose your describer.
-- **🖼️ DataLoader-batched descriptions** — the `read` tools are `load()` callers: N parallel reads coalesce into ONE batched vision call (dispatched after the microtask cascade settles), awaited during the tool-result phase (free time) so the agent's next turn never blocks on the describer. Descriptions are ready before `context` fires, so the swap is a non-blocking cache hit.
+- **🖼️ DataLoader-batched descriptions** — the `read` tools are `load()` callers: N parallel reads coalesce into ONE batched vision call (dispatched via `setImmediate` after the poll phase, so reads completing together batch instead of splitting), awaited during the tool-result phase (free time) so the agent's next turn never blocks on the describer. Descriptions are ready before `context` fires, so the swap is a non-blocking cache hit.
 - **🧹 Hides pi's "model does not support images" note** — on read results the extension strips pi's `[Current model does not support images…]` note from the text block (it's misleading once the handoff delivers the image's content as text), while keeping the image block for kitty inline rendering and `/resume`.
 - **🔌 Provider-agnostic** — uses pi's own model execution machinery (`@earendil-works/pi-ai`'s `complete()`), so it works with any provider/configured model, including custom provider extensions.
 - **🧠 Automatic targets** — by default, handoff applies to *every* model that lacks native vision. Opt out with `/vision-handoff auto off`.
@@ -139,7 +139,8 @@ pi -e ./vision-handoff.ts
 The extension implements the **Facebook DataLoader pattern** for image
 descriptions. The `read` tools are the `load()` callers; a per-image cache
 memoizes promises; all `load()` calls in the same execution frame coalesce
-into ONE batched vision call, dispatched after the microtask cascade settles.
+into ONE batched vision call, dispatched via `setImmediate` after the poll
+phase (so reads completing together batch instead of splitting into N calls).
 
     → before_agent_start
         • captures this turn's user prompt (shared by every image description)
@@ -162,10 +163,12 @@ into ONE batched vision call, dispatched after the microtask cascade settles.
         • pi runs `read` calls in parallel (Promise.all); each read's
           tool_result handler calls `loadDescription(img)` for its image
           blocks and AWAITS the shared batch
-        • DataLoader: all `load()` calls in the same microtask frame land in
-          ONE batch → ONE `complete()` vision call for the whole read set
-          (dispatched after the microtask cascade via enqueuePostPromiseJob:
-          `Promise.resolve().then(() => process.nextTick(dispatch))`)
+        • DataLoader: all `load()` calls in one event-loop poll iteration
+          land in ONE batch → ONE `complete()` vision call for the whole read
+          set. `enqueuePostPromiseJob` schedules dispatch via `setImmediate`
+          (the check phase, which runs AFTER the whole poll phase — not
+          `process.nextTick`, which would drain between the reads' I/O
+          callbacks and split them into N single-image calls)
         • awaits the shared batch — runs the describer during the tool-result
           phase (free time: the agent is just waiting for tool results), so
           the batch is COMPLETE before `context` fires → `context` is a
@@ -193,24 +196,35 @@ A single frame's image set is described with **one** vision-model call, not
 one per image. `loadDescription(img)` is synchronous: on a cache miss it
 pushes the image's key (hash) into the current batch and returns a memoized
 promise; on a cache hit it returns the existing (in-flight or resolved)
-promise. `enqueuePostPromiseJob` schedules dispatch after the microtask
-cascade settles, so every `load()` caller in the frame registers its key
-before the single vision call fires — exactly DataLoader's `getCurrentBatch`
-+ `enqueuePostPromiseJob`. The batched call sends every uncached image in a
-single user message with per-image `<<<IMAGE k>>> … <<<END>>>` delimiters; the
-response is parsed back into per-image descriptions (keyed by
-`sha256(mime + base64)` in the per-image cache). If the vision model ignores
-the delimiter format and the batched response can't be split, each unparsed
-image falls back to its own single-image `complete()` call **in parallel**
-(no delimiters to cooperate with) — descriptions still arrive together. Only
-when a per-image call itself genuinely fails (auth, timeout, empty) does that
-image degrade to `[Image: description unavailable]`; one bad image never
-voids the rest.
+promise. `enqueuePostPromiseJob` schedules dispatch via `setImmediate` (the
+check phase, after the whole poll phase AND after the microtask queue
+drains), so every `load()` caller — whether from sync code, a `.then`
+cascade, or a separate I/O callback in the same poll iteration — registers
+its key before the single vision call fires. This is why N parallel reads
+coalesce into one call rather than splitting into N single-image calls:
+`setImmediate` defers past the entire poll phase, whereas DataLoader's
+classic `process.nextTick` would drain between the reads' I/O callbacks and
+fire a dispatch after the first read but before the second. The batched call
+sends every uncached image in a single user message with per-image
+`<<<IMAGE k>>> … <<<END>>>` delimiters; the response is parsed back into
+per-image descriptions (keyed by `sha256(mime + base64)` in the per-image
+cache). If the vision model ignores the delimiter format and the batched
+response can't be split, each unparsed image falls back to its own
+single-image `complete()` call **in parallel** (no delimiters to cooperate
+with) — descriptions still arrive together. Only when a per-image call
+itself genuinely fails (auth, timeout, empty) does that image degrade to
+`[Image: description unavailable]`; one bad image never voids the rest.
 
-Because pi runs parallel `read` tool calls via `Promise.all` and fires the
-`tool_result` event inside that `Promise.all` (via `agent.afterToolCall` →
-`finalizeExecutedToolCall`), N parallel reads' `load()` calls share ONE
-microtask frame → ONE batch → ONE vision call, all resolving together.
+Because pi runs parallel `read` tool calls via `Promise.all` and fires
+each read's `tool_result` event as that read's I/O completes (poll phase) —
+via `agent.afterToolCall` → `finalizeExecutedToolCall` — the loader's
+`setImmediate` dispatch defers to the check phase AFTER the whole poll
+iteration, so reads completing together share ONE batch → ONE vision call,
+all resolving together. Reads completing in separate poll iterations get
+separate calls, but always in parallel, never sequential. (The per-image
+cache also dedupes a duplicate `load()` of the same image in one frame:
+dispatch resolves every callback by hash, so a second load whose first cache
+entry was evicted mid-frame still resolves — it never hangs.)
 
 **Failures are never cached.**
 
