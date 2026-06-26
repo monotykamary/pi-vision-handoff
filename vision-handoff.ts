@@ -670,15 +670,15 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   const ref = result.ref;
   const thinking = result.thinking;
   const thinkingLevel = result.thinkingLevel;
+  // Fold the thinking state into the single updateConfig notify so the
+  // "thinking off" message can't overwrite the model-change message.
+  const thinkingNote = thinking
+    ? `thinking on (${thinkingLevel})${ref ? " — applies only if the vision model supports reasoning" : ""}`
+    : "thinking off";
   updateConfig(
     ctx,
     (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel }),
-    ref ? `Vision model set to ${ref}` : "Vision model cleared",
-  );
-  ctx.ui.notify(
-    `Thinking: ${thinking ? `on (${thinkingLevel})` : "off"}` +
-      (thinking && ref ? " — applies only if the vision model supports reasoning" : ""),
-    "info",
+    ref ? `Vision model set to ${ref} · ${thinkingNote}` : `Vision model cleared · ${thinkingNote}`,
   );
   if (!ref) {
     ctx.ui.notify("Handoff is inactive until you pick a vision model.", "warning");
