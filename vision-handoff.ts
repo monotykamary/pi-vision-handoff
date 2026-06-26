@@ -53,6 +53,7 @@ import { DescriptionLoader, UNAVAILABLE, type LoaderDeps } from "./src/dataloade
 import { imageHash, findClipboardImagePaths, readImageBuffer, resolvePrewarmImage } from "./src/image.js";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
+import { PrewarmEditor } from "./src/prewarm-editor.js";
 
 let config: VisionHandoffConfig = readConfig();
 
@@ -69,6 +70,15 @@ let lastDescriberError: string | null = null;
  *  without this guard a broken vision model would spam a warning per turn.
  *  Cleared on `session_start`. */
 const warnedHashes = new Set<string>();
+
+/** Current model, tracked so the paste-time prewarm gate can skip prewarming
+ *  when the active model is vision-capable (handoff won't run → a prewarm
+ *  would be a wasted vision call). Updated in session_start and model_select. */
+let currentModel: Model<Api> | undefined | null;
+
+/** Whether the paste-time prewarm editor is installed this session. False in
+ *  non-TUI modes or when another extension already replaced the editor. */
+let editorInstalled = false;
 
 let visionModelCache: { ref: string; model: Model<Api> } | null = null;
 let visionModelUnresolvedRef: string | null = null;
@@ -110,6 +120,60 @@ function isHandoffTarget(
   if (cfg.handoffModels.includes(ref)) return true;
   if (cfg.autoHandoff && !isVisionModel(model)) return true;
   return false;
+}
+
+/** Whether paste-time prewarm should fire for a text change right now: the
+ *  opt-in flag is on, handoff is configured, and the active model is a handoff
+ *  target (so the prewarmed description will actually be consumed — a
+ *  vision-capable model needs no handoff, so prewarming would waste a call). */
+function shouldPrewarmPaste(): boolean {
+  return config.prewarmPastedImages && isConfigured(config) && isHandoffTarget(currentModel, config);
+}
+
+/** Prewarm one pasted clipboard image path through the dataloader at paste
+ *  time. Mirrors the before_agent_start clipboard prewarm, but binds only the
+ *  model registry (no turn signal — the agent is idle at paste time) and
+ *  resets the turn prompt to "" so a stale previous-turn prompt can't leak
+ *  into the description. The user's question isn't typed yet at paste time, so
+ *  the description is generated without question context (the documented
+ *  tradeoff of the opt-in). If the user submits before this dispatch fires,
+ *  before_agent_start overwrites the prompt — a benign bonus, not a bug. */
+function prewarmClipboardPath(path: string, modelRegistry: ModelRegistry): void {
+  const read = readImageBuffer(path);
+  if (!read) return;
+  resolvePrewarmImage(read.buf, read.mimeType, resizeImage)
+    .then((img) => {
+      if (!img) return;
+      loader.setPendingTurnPrompt("");
+      loader.bindTurnContext({ modelRegistry });
+      loader.loadDescription(img).catch(() => {});
+    })
+    .catch(() => {});
+}
+
+/** Install the paste-time prewarm editor wrapper for this session. TUI only,
+ *  and only when no other extension has replaced the editor — installing over
+ *  a custom editor would clobber its input handling and break clipboard paste
+ *  (pi wires paste-image to the outermost editor only). When a custom editor
+ *  is present, paste-time prewarm is unavailable; submit-time prewarm
+ *  (before_agent_start) still covers clipboard paths. */
+function installPrewarmEditor(ctx: ExtensionContext): void {
+  if (ctx.mode !== "tui") {
+    editorInstalled = false;
+    return;
+  }
+  if (ctx.ui.getEditorComponent()) {
+    editorInstalled = false;
+    return;
+  }
+  editorInstalled = true;
+  ctx.ui.setEditorComponent((_tui, theme, keybindings) =>
+    new PrewarmEditor(_tui, theme, keybindings, {
+      modelRegistry: ctx.modelRegistry,
+      shouldPrewarm: shouldPrewarmPaste,
+      prewarmPath: prewarmClipboardPath,
+    }),
+  );
 }
 
 function notifyUnresolvedVisionModel(ctx: ExtensionContext, ref: string): void {
@@ -169,13 +233,15 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     // Reload in case the user edited the config on disk from another session.
     config = readConfig();
     visionModelCache = null;
     visionModelUnresolvedRef = null;
     warnedHashes.clear();
     loader.reset();
+    currentModel = ctx.model;
+    installPrewarmEditor(ctx);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -405,6 +471,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("model_select", (event, ctx) => {
+    currentModel = event.model;
     if (!ctx.hasUI) return;
     if (!isConfigured(config)) return;
     const model = event.model;
@@ -420,7 +487,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("vision-handoff", {
     description: HANDOFF_COMMAND_DESCRIPTION,
     getArgumentCompletions(prefix: string) {
-      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "add", "remove", "clear", "help"];
+      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "prewarm", "add", "remove", "clear", "help"];
       const matches = subcommands.filter((s) => s.startsWith(prefix));
       return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
     },
@@ -454,6 +521,8 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "  /vision-handoff auto <on|off>  Toggle automatic handoff for all non-vision models",
         "  /vision-handoff thinking <off|minimal|low|medium|high|xhigh>",
         "                               Set the vision describer's thinking effort (off = disabled)",
+        "  /vision-handoff prewarm <on|off>",
+        "                               Toggle describing pasted images at paste-time (opt-in, off by default)",
         "  /vision-handoff add <p/id>     Force handoff for an extra model",
         "  /vision-handoff remove <p/id>  Stop forcing handoff for a model",
         "  /vision-handoff clear          Clear the configured vision model",
@@ -463,6 +532,7 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "Mechanism: before_agent_start warms a description cache; tool_result loads",
         "  read images through a dataloader (one batched vision call); context swaps",
         "  image blocks in the payload for the cached text description.",
+        "  prewarm on wraps the editor to describe pasted images at paste-time.",
       ].join("\n"),
       "info",
     );
@@ -501,6 +571,11 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
 
   if (subcommand === "thinking") {
     handleThinkingSubcommand(ctx, rest);
+    return;
+  }
+
+  if (subcommand === "prewarm") {
+    handlePrewarmSubcommand(ctx, rest);
     return;
   }
 
@@ -629,6 +704,30 @@ function handleThinkingSubcommand(ctx: ExtensionCommandContext, rest: string): v
   );
 }
 
+/** Handle `/vision-handoff prewarm <on|off>` — toggle paste-time prewarm. */
+function handlePrewarmSubcommand(ctx: ExtensionCommandContext, rest: string): void {
+  const value = rest.trim().toLowerCase();
+  if (!value) {
+    ctx.ui.notify(
+      `Paste-time prewarm: ${config.prewarmPastedImages ? "on" : "off"}.\n` +
+        `Usage: /vision-handoff prewarm <on|off>`,
+      "info",
+    );
+    return;
+  }
+  if (value !== "on" && value !== "off") {
+    ctx.ui.notify("Usage: /vision-handoff prewarm <on|off>", "warning");
+    return;
+  }
+  const on = value === "on";
+  const note = on
+    ? editorInstalled
+      ? "Paste-time prewarm on — pasted images are described the instant their path lands in the prompt (before submit)."
+      : "Paste-time prewarm on — but another custom editor extension is active, so it's unavailable. Submit-time prewarm still works; disable the other editor extension (or /vision-handoff prewarm off) to silence this."
+    : "Paste-time prewarm off — images are described at submit time (default).";
+  updateConfig(ctx, (c) => ({ ...c, prewarmPastedImages: on }), note);
+}
+
 async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify("/vision-handoff requires interactive mode.", "error");
@@ -692,6 +791,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
   lines.push(`Auto handoff (non-vision models): ${config.autoHandoff ? "on" : "off"}`);
   lines.push(`Handoff targets (explicit): ${config.handoffModels.length ? config.handoffModels.join(", ") : "(none)"}`);
   lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
+  lines.push(`Paste-time prewarm: ${config.prewarmPastedImages ? `on${editorInstalled ? "" : " (inactive — another custom editor is active)"}` : "off"}`);
   lines.push(`maxTokens: ${config.maxTokens ?? "unbounded"} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
 
   const model = ctx.model;

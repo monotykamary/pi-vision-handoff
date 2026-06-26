@@ -136,6 +136,18 @@ export interface VisionHandoffConfig {
   autoHandoff: boolean;
   /** Extra "provider/id" refs that should ALSO receive handoff (e.g. weak vision models). */
   handoffModels: string[];
+  /** Opt-in: when true, the editor is wrapped at session start to describe
+   *  pasted clipboard images the instant their temp-file path lands in the
+   *  prompt (pre-submit), instead of waiting for submit. Trades a bit of
+   *  description quality (the description is generated without the user's
+   *  typed question as context, since the question usually isn't entered yet
+   *  at paste time) and a speculative vision call on paste-then-abandon, for
+   *  earlier prewarm. Off by default — submit-time prewarm
+   *  (before_agent_start) still covers this case when off. TUI mode only, and
+   *  inactive when another extension has replaced the editor (installing over
+   *  a custom editor would break clipboard paste, since pi wires paste-image
+   *  to the outermost editor only). */
+  prewarmPastedImages: boolean;
   /** Max output tokens for a single description. `undefined` (default) = use the
    *  vision model's declared max output (`model.maxTokens`) as the cap — the
    *  highest the model supports — so the "be exhaustive" prompt isn't defeated
@@ -172,6 +184,7 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   visionModel: null,
   autoHandoff: true,
   handoffModels: [],
+  prewarmPastedImages: false,
   maxTokens: undefined,
   cacheMax: DEFAULT_CACHE_MAX,
   maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
@@ -221,6 +234,7 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
       .map((m) => m.trim())
       .filter((m) => m && parseModelRef(m));
   }
+  if (typeof obj.prewarmPastedImages === "boolean") base.prewarmPastedImages = obj.prewarmPastedImages;
   // maxTokens: optional. undefined (default) = no artificial cap. Only set when
   // a valid positive finite number is given; any other value leaves it unset.
   if (typeof obj.maxTokens === "number" && Number.isFinite(obj.maxTokens) && obj.maxTokens > 0) {

@@ -138,6 +138,19 @@ describe("normalizeConfig", () => {
     expect(normalizeConfig({}).thinkingLevel).toBe("medium");
   });
 
+  it("prewarmPastedImages defaults to false (opt-in) and accepts a boolean", () => {
+    expect(DEFAULT_CONFIG.prewarmPastedImages).toBe(false);
+    expect(normalizeConfig({}).prewarmPastedImages).toBe(false);
+    expect(normalizeConfig({ prewarmPastedImages: true }).prewarmPastedImages).toBe(true);
+    expect(normalizeConfig({ prewarmPastedImages: false }).prewarmPastedImages).toBe(false);
+  });
+
+  it("prewarmPastedImages ignores non-boolean values", () => {
+    expect(normalizeConfig({ prewarmPastedImages: "yes" }).prewarmPastedImages).toBe(false);
+    expect(normalizeConfig({ prewarmPastedImages: 1 }).prewarmPastedImages).toBe(false);
+    expect(normalizeConfig({ prewarmPastedImages: null }).prewarmPastedImages).toBe(false);
+  });
+
   it("thinking accepts a boolean on/off and a valid level", () => {
     const cfg = normalizeConfig({ thinking: true, thinkingLevel: "high" });
     expect(cfg.thinking).toBe(true);

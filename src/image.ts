@@ -272,3 +272,20 @@ export function findClipboardImagePaths(prompt: string): string[] {
   }
   return [...paths];
 }
+
+/** Diff the clipboard image paths in `text` against `known`, returning those
+ *  that are newly appeared (not yet seen). Used by the paste-time prewarm
+ *  editor to prewarm only newly-pasted paths on each text change, without
+ *  re-reading already-seen ones. `findClipboardImagePaths` already dedups
+ *  within a single text, so each returned path is unique and seen at most
+ *  once. Returns [] when `text` holds no clipboard paths (e.g. ordinary
+ *  typing) — so the editor's per-keystroke cost when the opt-in is on is one
+ *  regex scan that almost always yields nothing. */
+export function diffPrewarmPaths(text: string, known: Set<string>): string[] {
+  const paths = findClipboardImagePaths(text);
+  const newPaths: string[] = [];
+  for (const p of paths) {
+    if (!known.has(p)) newPaths.push(p);
+  }
+  return newPaths;
+}

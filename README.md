@@ -43,6 +43,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 - **🧠 Automatic targets** — by default, handoff applies to *every* model that lacks native vision. Opt out with `/vision-handoff auto off`.
 - **🗂️ Explicit overrides** — force handoff for specific models (e.g. a weak vision model) with `/vision-handoff add`.
 - **⚡ Pre-warmed at paste-enter** — the moment you press enter, `before_agent_start` scans the prompt for pasted clipboard image temp-file paths (pi writes pasted images to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the path as text), reads them, and kicks off the ONE batched vision call concurrent with the agent's first response — so by the time the agent reads the files, they're already cache hits.
+- **🚀 Paste-time prewarm (opt-in)** — `prewarmPastedImages` (off by default) wraps the editor so pasted clipboard images are described the *instant* their path lands in the prompt — before you hit enter — not at submit. The vision call starts concurrent with you typing your question. Tradeoff: the description is generated without your typed question as context (the question usually isn't entered yet at paste time), and a paste-then-abandon wastes one vision call. TUI only; inactive if another extension replaces the editor. Toggle with `/vision-handoff prewarm on`.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
 - **📊 Usage reporting** — every real describer call reports model + tokens (and Neuralwatt energy/cost when the vision model is a Neuralwatt model), via `pi.appendEntry` + a `vision-handoff:usage` event for live consumers.
 - **🔧 Tunable** — cap description length (`maxDescriptionLines`; unbounded by default, so `read`'s native `ctrl+o` collapse handles compactness) and cache size, in the config file.
@@ -59,6 +60,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 | `/vision-handoff status` | Show current config + whether handoff is active for the current model |
 | `/vision-handoff enable` / `disable` | Master switch (keeps your configured model) |
 | `/vision-handoff auto on` / `off` | Toggle automatic handoff for all non-vision models |
+| `/vision-handoff prewarm on` / `off` | Toggle paste-time prewarm (opt-in, off by default) |
 | `/vision-handoff add ollama/llava:13b` | Force handoff for an extra model |
 | `/vision-handoff remove ollama/llava:13b` | Stop forcing handoff for a model |
 | `/vision-handoff clear` | Clear the configured vision model |
@@ -74,6 +76,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
   "visionModel": "openai/gpt-4o",
   "autoHandoff": true,
   "handoffModels": ["ollama/llava:13b"],
+  "prewarmPastedImages": false,
   "maxTokens": null,
   "cacheMax": 50,
   "maxDescriptionLines": 0,
@@ -88,6 +91,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `visionModel` | `null` | The describer, as `provider/id`. `null` = not configured (handoff inactive). |
 | `autoHandoff` | `true` | Apply handoff to every model whose `input` does not include `image`. |
 | `handoffModels` | `[]` | Extra `provider/id` refs that should also receive handoff. |
+| `prewarmPastedImages` | `false` | **Opt-in paste-time prewarm.** When `true`, a custom editor wrapper describes pasted clipboard images the instant their temp-file path lands in the prompt (pre-submit), instead of at submit. Trades a bit of description quality (the description is generated without your typed question as context, since the question usually isn't entered yet at paste time) and a speculative vision call on paste-then-abandon, for earlier prewarm. TUI mode only; inactive if another extension has replaced the editor. |
 | `maxTokens` | _(unset = model max, clamped to context window)_ | Cap on a single description's output. `null`/unset = use the vision model's declared max output (`model.maxTokens`), clamped so `maxTokens + 8192 <= contextWindow` (a model whose declared max equals its full context window would otherwise be rejected with a 400). Set a number only to cap cost/latency. A truncation is always surfaced via a `[... description truncated …]` marker when the model hits the limit, so a cut-off description is never mistaken for complete. |
 | `cacheMax` | `50` | Max described images kept in the in-memory cache per session. |
 | `maxDescriptionLines` | `0` | Cap on description lines (`0` = unbounded). Default keeps the full description so the `read` tool's native collapse (`ctrl+o`) handles compactness and the model gets complete context; setting `> 0` applies a lossy head-cap to both the TUI render and the model. |
@@ -141,6 +145,26 @@ descriptions. The `read` tools are the `load()` callers; a per-image cache
 memoizes promises; all `load()` calls in the same execution frame coalesce
 into ONE batched vision call, dispatched via `setImmediate` after the poll
 phase (so reads completing together batch instead of splitting into N calls).
+
+With `prewarmPastedImages` on (opt-in), an even earlier stage runs:
+
+    → editor onChange (paste-time, pre-submit)
+        • pi has no "image pasted" event; the earliest signal is the editor's
+          `onChange(text)`, which fires when pi's `handleClipboardImagePaste`
+          inserts the temp-file path via `insertTextAtCursor`
+        • a wrapping CustomEditor chains `onChange` (pi assigns its own
+          `onChange` — for bash-mode border tracking — after construction, so
+          the wrapper captures it via an accessor and runs it alongside an
+          observer that `diffPrewarmPaths`s new `pi-clipboard-*` paths and
+          `loadDescription()`s them at paste-time — the vision call starts
+          before you hit enter; `before_agent_start`'s same-path prewarm is
+          then a cache hit
+        • it does NOT override `handleInput`, so keybindings + `ctrl+v` paste
+          are untouched; TUI only, and skipped when another extension has
+          replaced the editor (installing over one would break paste, since
+          pi wires paste-image to the outermost editor only)
+
+The default submit-time pipeline below runs regardless:
 
     → before_agent_start
         • captures this turn's user prompt (shared by every image description)
@@ -346,6 +370,7 @@ pnpm lint:dead     # Dead code detection (knip)
 │   ├── dataloader.ts              # DescriptionLoader — DataLoader-batched descriptions (Disposable)
 │   ├── describer.ts              # Vision describer calls (runBatch / describeSingle) with `using` resource guards
 │   ├── image.ts                  # Image hashing, MIME sniffing, clipboard-path reading
+│   ├── prewarm-editor.ts        # Opt-in paste-time prewarm CustomEditor wrapper (chains onChange)
 │   ├── dispose.ts                 # `Disposable` guard factories for `using` (fetch interceptor, timer, abort wire)
 │   ├── usage.ts                  # Describer usage + Neuralwatt energy capture, fetch interceptor
 │   └── vision-model-selector.ts  # Interactive picker TUI component
@@ -355,7 +380,7 @@ pnpm lint:dead     # Dead code detection (knip)
 │   ├── vision-handoff.test.ts    # Config, refs, image-block extraction, insertion, truncation, round-trip
 │   ├── dataloader.test.ts        # Batch coalescing, memoization, failure eviction, Disposable reset
 │   ├── describer.test.ts        # stopReason handling (length → truncation marker, aborted/error)
-│   ├── image.test.ts             # MIME sniffing, clipboard-path confinement, file reading
+│   ├── image.test.ts             # MIME sniffing, clipboard-path confinement, file reading, diffPrewarmPaths
 │   └── dispose.test.ts           # `using` guards: fetch refcount, timeout, abort-wire propagation
 ├── package.json
 ├── tsconfig.json

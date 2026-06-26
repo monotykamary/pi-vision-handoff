@@ -10,6 +10,7 @@ import {
   resolvePrewarmImage,
   readImageBuffer,
   findClipboardImagePaths,
+  diffPrewarmPaths,
   imageHash,
 } from "../../src/image.js";
 
@@ -343,5 +344,43 @@ describe("findClipboardImagePaths", () => {
     expect(findClipboardImagePaths(`${tmp}/pi-clipboard-a.webp ${tmp}/pi-clipboard-b.jpeg`).sort()).toEqual(
       [`${tmp}/pi-clipboard-a.webp`, `${tmp}/pi-clipboard-b.jpeg`].sort(),
     );
+  });
+});
+
+// ── diffPrewarmPaths ─────────────────────────────────────────────────────────
+
+describe("diffPrewarmPaths", () => {
+  const tmp = tmpdir();
+
+  it("returns paths not already in known", () => {
+    const a = `${tmp}/pi-clipboard-a.png`;
+    const b = `${tmp}/pi-clipboard-b.png`;
+    expect(diffPrewarmPaths(`${a} ${b}`, new Set([a]))).toEqual([b]);
+  });
+
+  it("returns [] when every path is already known", () => {
+    const a = `${tmp}/pi-clipboard-a.png`;
+    expect(diffPrewarmPaths(a, new Set([a]))).toEqual([]);
+  });
+
+  it("returns [] for text with no clipboard paths (ordinary typing)", () => {
+    expect(diffPrewarmPaths("hello world, what is this?", new Set())).toEqual([]);
+    expect(diffPrewarmPaths("", new Set())).toEqual([]);
+  });
+
+  it("dedupes within the text (a repeated new path is returned once)", () => {
+    const a = `${tmp}/pi-clipboard-a.png`;
+    expect(diffPrewarmPaths(`${a} ${a}`, new Set())).toEqual([a]);
+  });
+
+  it("only reports genuinely new paths across multiple text changes", () => {
+    const a = `${tmp}/pi-clipboard-a.png`;
+    const b = `${tmp}/pi-clipboard-b.png`;
+    const known = new Set<string>();
+    // first change: both new
+    expect(diffPrewarmPaths(`${a} ${b}`, known)).toEqual([a, b].sort());
+    known.add(a); known.add(b);
+    // second change (text now only mentions a, b was deleted): no new paths
+    expect(diffPrewarmPaths(a, known)).toEqual([]);
   });
 });

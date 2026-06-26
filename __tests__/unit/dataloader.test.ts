@@ -31,6 +31,7 @@ function makeLoader(
     visionModel: "p/id",
     autoHandoff: true,
     handoffModels: [],
+    prewarmPastedImages: false,
     maxTokens: undefined,
     cacheMax: 50,
     maxDescriptionLines: 0,
