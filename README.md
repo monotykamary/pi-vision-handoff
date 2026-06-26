@@ -39,7 +39,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 - **🎮 Interactive picker** — `/vision-handoff` opens a TUI listing every model, vision-capable ones first (👁), to choose your describer.
 - **🖼️ DataLoader-batched descriptions** — the `read` tools are `load()` callers: N parallel reads coalesce into ONE batched vision call (dispatched via `setImmediate` after the poll phase, so reads completing together batch instead of splitting), awaited during the tool-result phase (free time) so the agent's next turn never blocks on the describer. Descriptions are ready before `context` fires, so the swap is a non-blocking cache hit.
 - **🧹 Hides pi's "model does not support images" note** — on read results the extension strips pi's `[Current model does not support images…]` note from the text block (it's misleading once the handoff delivers the image's content as text), while keeping the image block for kitty inline rendering and `/resume`.
-- **🔌 Provider-agnostic** — uses pi's own model execution machinery (`@earendil-works/pi-ai`'s `complete()`), so it works with any provider/configured model, including custom provider extensions.
+- **🔌 Provider-agnostic** — uses pi's own model execution machinery (`@earendil-works/pi-ai`'s `completeSimple()`), so it works with any provider/configured model, including custom provider extensions.
 - **🧠 Automatic targets** — by default, handoff applies to *every* model that lacks native vision. Opt out with `/vision-handoff auto off`.
 - **🗂️ Explicit overrides** — force handoff for specific models (e.g. a weak vision model) with `/vision-handoff add`.
 - **⚡ Pre-warmed at paste-enter** — the moment you press enter, `before_agent_start` scans the prompt for pasted clipboard image temp-file paths (pi writes pasted images to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the path as text), reads them, and kicks off the ONE batched vision call concurrent with the agent's first response — so by the time the agent reads the files, they're already cache hits.
@@ -164,7 +164,7 @@ phase (so reads completing together batch instead of splitting into N calls).
           tool_result handler calls `loadDescription(img)` for its image
           blocks and AWAITS the shared batch
         • DataLoader: all `load()` calls in one event-loop poll iteration
-          land in ONE batch → ONE `complete()` vision call for the whole read
+          land in ONE batch → ONE `completeSimple()` vision call for the whole read
           set. `enqueuePostPromiseJob` schedules dispatch via `setImmediate`
           (the check phase, which runs AFTER the whole poll phase — not
           `process.nextTick`, which would drain between the reads' I/O
@@ -210,7 +210,7 @@ sends every uncached image in a single user message with per-image
 per-image descriptions (keyed by `sha256(mime + base64)` in the per-image
 cache). If the vision model ignores the delimiter format and the batched
 response can't be split, each unparsed image falls back to its own
-single-image `complete()` call **in parallel** (no delimiters to cooperate
+single-image `completeSimple()` call **in parallel** (no delimiters to cooperate
 with) — descriptions still arrive together. Only when a per-image call
 itself genuinely fails (auth, timeout, empty) does that image degrade to
 `[Image: description unavailable]`; one bad image never voids the rest.
@@ -268,7 +268,7 @@ off mid-stream); earlier sections had `<<<END>>>` delimiters and are complete.
 it before the LLM call), so a slow describer would also make aborting a turn
 slow — pi has to wait for the transform to return. The hook therefore wires
 the turn's abort signal (`ctx.signal`, the active run's `AbortController`)
-into the describer's `complete()` call, so a user cancel kills the in-flight
+into the describer's `completeSimple()` call, so a user cancel kills the in-flight
 vision request immediately. A deliberate abort is not warned about (it's
 not a vision-model failure) and the LLM-bound payload is left untouched since
 the turn is being torn down anyway.
@@ -282,7 +282,7 @@ the turn is being torn down anyway.
 | `context` (all messages) | `{ type: "input_image", image_url: "data:…" }` (OpenAI Responses) | detected by shape → replaced with `{ type: "input_text", text }` |
 | `context` (all messages) | `{ type: "image", source: { type: "base64", media_type, data } }` (Anthropic Messages) | detected by shape → replaced with `{ type: "text", text }` |
 
-The describer call itself goes through pi's normal model machinery (`complete()`),
+The describer call itself goes through pi's normal model machinery (`completeSimple()`),
 **not** the agent event loop — so it never re-triggers `context` (no recursion).
 The `read` tool result keeps its image block untouched (kitty inline + `/resume`);
 only the `context`-cloned LLM-bound payload has images swapped for text.

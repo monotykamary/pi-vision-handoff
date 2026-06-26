@@ -1,10 +1,19 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 
-// Mock complete() so the describer's stopReason handling is observable without
-// a provider. The mock is reconfigured per-test via mockComplete.mockResolvedValueOnce.
-const complete = vi.fn();
+// Mock completeSimple() so the describer's stopReason handling is observable
+// without a provider. The describer routes through completeSimple (not
+// complete): complete()/stream() silently drops the `reasoning` ThinkingLevel,
+// so only completeSimple()/streamSimple() translate it to provider-specific
+// reasoningEffort. `complete` is mocked to throw so any accidental revert
+// fails loudly instead of silently dropping thinking. The mocks are reconfigured
+// per-test via completeSimple.mockResolvedValueOnce.
+const completeSimple = vi.fn();
+const complete = vi.fn(() => {
+  throw new Error("describer must call completeSimple, not complete");
+});
 vi.mock("@earendil-works/pi-ai/compat", () => ({
+  completeSimple: (...args: unknown[]) => completeSimple(...(args as Parameters<typeof completeSimple>)),
   complete: (...args: unknown[]) => complete(...(args as Parameters<typeof complete>)),
 }));
 
@@ -53,16 +62,16 @@ function makeDeps(): DescriberDeps {
 }
 
 describe("describeSingle stopReason handling", () => {
-  beforeEach(() => complete.mockReset());
+  beforeEach(() => completeSimple.mockReset());
 
   it("returns the raw text on a clean stop", async () => {
-    complete.mockResolvedValueOnce(fakeResponse({ text: "full description", stopReason: "stop" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "full description", stopReason: "stop" }));
     const out = await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, makeDeps());
     expect(out).toBe("full description");
   });
 
   it("appends the truncation marker on stopReason length (not silent)", async () => {
-    complete.mockResolvedValueOnce(
+    completeSimple.mockResolvedValueOnce(
       fakeResponse({ text: "partial description cut off mid-sente", stopReason: "length" }),
     );
     const out = await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, makeDeps());
@@ -71,7 +80,7 @@ describe("describeSingle stopReason handling", () => {
 
   it("returns null (no marker) on an aborted/error stop, surfacing the error", async () => {
     const deps = makeDeps();
-    complete.mockResolvedValueOnce(fakeResponse({ stopReason: "error", errorMessage: "boom" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ stopReason: "error", errorMessage: "boom" }));
     const out = await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, deps);
     expect(out).toBeNull();
     expect(deps.setLastError).toHaveBeenCalledWith(expect.stringContaining("boom"));
@@ -79,24 +88,24 @@ describe("describeSingle stopReason handling", () => {
 
   it("returns null for an empty text response and surfaces an empty-description error", async () => {
     const deps = makeDeps();
-    complete.mockResolvedValueOnce(fakeResponse({ text: "", stopReason: "stop" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "", stopReason: "stop" }));
     const out = await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, deps);
     expect(out).toBeNull();
     expect(deps.setLastError).toHaveBeenCalledWith("vision model returned an empty description");
   });
 
   it("passes the vision model's declared maxTokens when cfg.maxTokens is unset", async () => {
-    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
     await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, makeDeps());
-    const opts = complete.mock.calls[0][2];
+    const opts = completeSimple.mock.calls[0][2];
     expect(opts.maxTokens).toBe(4096); // visionModel.maxTokens, not undefined
   });
 
   it("passes a configured cfg.maxTokens over the model's declared max", async () => {
-    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
     const capped = { ...cfg, maxTokens: 512 };
     await describeSingle(img("AAA"), "", visionModel, modelRegistry, capped, makeDeps());
-    const opts = complete.mock.calls[0][2];
+    const opts = completeSimple.mock.calls[0][2];
     expect(opts.maxTokens).toBe(512);
   });
 });
@@ -105,16 +114,16 @@ describe("thinking (reasoning) passthrough", () => {
   const reasoningModel = { ...visionModel, reasoning: true } as any;
   const nonReasoningModel = { ...visionModel, reasoning: false } as any;
 
-  beforeEach(() => complete.mockReset());
+  beforeEach(() => completeSimple.mockReset());
 
   it("omits reasoning when thinking is disabled in config", async () => {
-    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
     await describeSingle(img("AAA"), "", reasoningModel, modelRegistry, { ...cfg, thinking: false }, makeDeps());
-    expect(complete.mock.calls[0][2].reasoning).toBeUndefined();
+    expect(completeSimple.mock.calls[0][2].reasoning).toBeUndefined();
   });
 
   it("passes the configured thinkingLevel when thinking is on and the model reasons", async () => {
-    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
     await describeSingle(
       img("AAA"),
       "",
@@ -123,11 +132,11 @@ describe("thinking (reasoning) passthrough", () => {
       { ...cfg, thinking: true, thinkingLevel: "high" },
       makeDeps(),
     );
-    expect(complete.mock.calls[0][2].reasoning).toBe("high");
+    expect(completeSimple.mock.calls[0][2].reasoning).toBe("high");
   });
 
   it("omits reasoning when thinking is on but the model has no reasoning support", async () => {
-    complete.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
     await describeSingle(
       img("AAA"),
       "",
@@ -136,7 +145,39 @@ describe("thinking (reasoning) passthrough", () => {
       { ...cfg, thinking: true, thinkingLevel: "high" },
       makeDeps(),
     );
-    expect(complete.mock.calls[0][2].reasoning).toBeUndefined();
+    expect(completeSimple.mock.calls[0][2].reasoning).toBeUndefined();
+  });
+});
+
+describe("routes through completeSimple (not complete)", () => {
+  // Regression guard: the describer used to call complete(), which silently
+  // drops the `reasoning` ThinkingLevel — only completeSimple()/streamSimple()
+  // translate it into provider-specific reasoningEffort. If the describer ever
+  // calls complete(), the throwing mock fails the test with a clear message.
+  beforeEach(() => {
+    completeSimple.mockReset();
+    complete.mockReset();
+    complete.mockImplementation(() => {
+      throw new Error("describer must call completeSimple, not complete");
+    });
+  });
+
+  it("describeSingle calls completeSimple and never complete", async () => {
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "ok", stopReason: "stop" }));
+    await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, makeDeps());
+    expect(completeSimple).toHaveBeenCalledTimes(1);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it("runBatch calls completeSimple and never complete", async () => {
+    const a = img("AAA");
+    const ha = imageHash(a.mimeType, a.data);
+    completeSimple.mockResolvedValueOnce(
+      fakeResponse({ text: ["<<<IMAGE 1>>>", "one", "<<<END>>>"].join("\n"), stopReason: "stop" }),
+    );
+    await runBatch([{ img: a, hash: ha }], "", visionModel, modelRegistry, cfg, makeDeps());
+    expect(completeSimple).toHaveBeenCalledTimes(1);
+    expect(complete).not.toHaveBeenCalled();
   });
 });
 
@@ -187,7 +228,7 @@ describe("resolveMaxTokens", () => {
 });
 
 describe("runBatch stopReason handling", () => {
-  beforeEach(() => complete.mockReset());
+  beforeEach(() => completeSimple.mockReset());
 
   it("marks only the LAST parsed image on stopReason length (the one cut off mid-stream)", async () => {
     const a = img("AAA");
@@ -196,7 +237,7 @@ describe("runBatch stopReason handling", () => {
     const ha = imageHash(a.mimeType, a.data);
     const hb = imageHash(b.mimeType, b.data);
     const hc = imageHash(c.mimeType, c.data);
-    complete.mockResolvedValueOnce(
+    completeSimple.mockResolvedValueOnce(
       fakeResponse({
         text: [
           "<<<IMAGE 1>>>",
@@ -234,7 +275,7 @@ describe("runBatch stopReason handling", () => {
     const b = img("BBB");
     const ha = imageHash(a.mimeType, a.data);
     const hb = imageHash(b.mimeType, b.data);
-    complete.mockResolvedValueOnce(
+    completeSimple.mockResolvedValueOnce(
       fakeResponse({
         text: ["<<<IMAGE 1>>>", "one", "<<<END>>>", "<<<IMAGE 2>>>", "two", "<<<END>>>"].join("\n"),
         stopReason: "stop",
@@ -250,7 +291,7 @@ describe("runBatch stopReason handling", () => {
     const deps = makeDeps();
     const a = img("AAA");
     const ha = imageHash(a.mimeType, a.data);
-    complete.mockResolvedValueOnce(fakeResponse({ stopReason: "aborted" }));
+    completeSimple.mockResolvedValueOnce(fakeResponse({ stopReason: "aborted" }));
     const out = await runBatch([{ img: a, hash: ha }], "", visionModel, modelRegistry, cfg, deps);
     expect(out.size).toBe(0);
     expect(deps.setLastError).toHaveBeenCalled();

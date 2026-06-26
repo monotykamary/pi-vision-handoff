@@ -3,7 +3,7 @@
  *
  * One record is produced per REAL describer provider call (cache hits emit
  * nothing):
- *   - model + tokens: from complete()'s AssistantMessage.usage
+ *   - model + tokens: from completeSimple()'s AssistantMessage.usage
  *   - energy + cost + raw MCR/energy/cost payloads: from Neuralwatt SSE comment
  *     lines parsed out of the teed response body (readEnergyFromTee). Present
  *     ONLY when the vision model is a Neuralwatt model — non-Neuralwatt models
@@ -197,7 +197,7 @@ export function buildUsageRecord(
 
 // ── Concurrency-safe fetch interceptor ─────────────────────────────────────
 //
-// The only body-interception point for complete() is globalThis.fetch (pi-ai's
+// The only body-interception point for completeSimple() is globalThis.fetch (pi-ai's
 // StreamOptions.onResponse exposes headers only, not the body where the
 // `: energy` SSE comments live). before_agent_start fires several describeImage()
 // calls fire-and-forget, so a naïve save/patch/restore of globalThis.fetch would

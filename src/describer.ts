@@ -1,6 +1,14 @@
 /**
- * The vision describer: calls a vision-capable model via pi-ai's `complete()`
- * to produce text descriptions of images.
+ * The vision describer: calls a vision-capable model via pi-ai's
+ * `completeSimple()` to produce text descriptions of images.
+ *
+ * `completeSimple` (not `complete`) is the path that translates the `reasoning`
+ * ThinkingLevel into each provider's `reasoningEffort`/budget. `complete()` →
+ * `stream()` reads only the pre-translated `reasoningEffort` field and silently
+ * drops a bare `reasoning`, so the describer's thinking setting would be a no-op
+ * through `complete()` — the bug this swap fixes. The agent loop, SDK, and
+ * compaction all route thinking through `completeSimple`/`streamSimple` for the
+ * same reason.
  *
  * Two entry points:
  *   - {@link runBatch}: ONE batched call describing N images at once (the
@@ -13,13 +21,13 @@
  * Resource lifetimes (fetch interceptor, timeout timer, turn-abort wire) are
  * managed with the `using` keyword via the {@link Disposable} guards in
  * `dispose.ts`, replacing the manual `try`/`finally` cleanup the old code
- * carried. Disposing is lexical and exception-safe: a thrown `complete()`
+ * carried. Disposing is lexical and exception-safe: a thrown `completeSimple()`
  * still tears down the timer, uninstalls the interceptor, and detaches the
  * abort listener.
  */
 
 import type { Api, ImageContent, Message, Model, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
-import { complete } from "@earendil-works/pi-ai/compat";
+import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
   batchUserPrompt,
@@ -52,7 +60,7 @@ import { abortWireGuard, fetchInterceptorGuard, timeoutGuard, type AbortWire } f
  *  model (e.g. 262144 context − 8192 reserve = 253952 output budget). */
 const INPUT_RESERVE_TOKENS = 8192;
 
-/** Resolve the `maxTokens` to pass to `complete()` for a describer call.
+/** Resolve the `maxTokens` to pass to `completeSimple()` for a describer call.
  *
  *  - A configured `cfg.maxTokens` wins (explicit cost/latency cap), clamped to
  *    fit the context window.
@@ -76,7 +84,7 @@ export function resolveMaxTokens(
   return Math.max(1, Math.min(requested, cap));
 }
 
-/** Resolve the `reasoning` (thinking) level to pass to `complete()`, or
+/** Resolve the `reasoning` (thinking) level to pass to `completeSimple()`, or
  *  `undefined` to leave thinking off.
  *
  *  - Returns `undefined` when thinking is disabled in config.
@@ -108,7 +116,7 @@ export interface DescriberDeps {
 /** The result of a batched describer call: per-image raw descriptions keyed by hash. */
 export type BatchResult = Map<string, string>;
 
-/** Describe N images with ONE batched `complete()` call and split the response
+/** Describe N images with ONE batched `completeSimple()` call and split the response
  *  back into per-image descriptions. Returns a map keyed by image hash; an
  *  image whose section failed to parse is omitted (the caller treats omission
  *  as "description unavailable"). On a genuine call failure (auth, abort,
@@ -159,7 +167,7 @@ export async function runBatch(
   const describeCtx: DescribeContext = { energyReader: undefined };
   try {
     const response = await describeAls.run(describeCtx, async () =>
-      complete(
+      completeSimple(
         visionModel,
         { systemPrompt, messages: [userMessage] },
         { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens, reasoning },
@@ -231,7 +239,7 @@ export async function runBatch(
   }
 }
 
-/** Describe a single image with one `complete()` call and return the RAW
+/** Describe a single image with one `completeSimple()` call and return the RAW
  *  description (no envelope, no truncation). Returns null on any genuine
  *  failure (auth, abort/error, empty) so the caller only caches `UNAVAILABLE`
  *  when a real describer attempt failed. */
@@ -273,7 +281,7 @@ export async function describeSingle(
   const describeCtx: DescribeContext = { energyReader: undefined };
   try {
     const response = await describeAls.run(describeCtx, async () =>
-      complete(
+      completeSimple(
         visionModel,
         { systemPrompt, messages: [userMessage] },
         { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens, reasoning },

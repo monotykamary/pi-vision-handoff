@@ -38,7 +38,7 @@ export const DEFAULT_USER_PROMPT_PREFIX = "The user's request about this image: 
 export const IMAGE_PLACEHOLDER_PREFIX = "[Image: ";
 export const IMAGE_PLACEHOLDER_SUFFIX = "]";
 
-/** Marker appended to a description whose `complete()` call ended with
+/** Marker appended to a description whose `completeSimple()` call ended with
  *  `stopReason: "length"` — i.e. the vision model hit a token limit (either the
  *  configured `maxTokens` or the provider's hard output cap) before finishing.
  *  A truncated description is still useful, but the agent must not mistake it
