@@ -91,19 +91,68 @@ export class DescriptionLoader implements Disposable {
   private dispatchScheduled = false;
   private turnModelRegistry: ModelRegistry | null = null;
   private turnVisionModel: Model<Api> | null = null;
-  private turnSignal: AbortSignal | undefined;
+  /** Turn-level abort controller. In-flight describer batches (`runBatch`)
+   *  are wired to `turnAbortController.signal` so a user cancel (ESC) aborts
+   *  them EVEN WHEN the batch was dispatched before the run's live abort
+   *  signal existed — the `before_agent_start` / paste-time prewarm case,
+   *  where `ctx.signal` is `undefined` (the agent run hasn't started yet).
+   *  The run's live signal, once it arrives via `bindTurnContext`, is forwarded
+   *  into `turnAbortController.abort()`. Because `runBatch` holds a reference
+   *  to this controller's signal (not a snapshot of `ctx.signal`), a batch
+   *  that started during prewarm becomes abortable the instant a later
+   *  `bindTurnContext` (from `tool_result`/`context`) brings the live signal.
+   *  Reset per turn via {@link resetTurnAbort} so a previous turn's cancel
+   *  can't poison the next turn's prewarm. */
+  private turnAbortController = new AbortController();
+  /** The run signal currently forwarded into {@link turnAbortController}, so
+   *  the abort listener is attached at most once per signal (the same signal
+   *  is bound by every `tool_result`/`context` event in a turn). */
+  private wiredSignal: AbortSignal | undefined;
   private pendingTurnPrompt = "";
 
   constructor(private readonly deps: LoaderDeps) {}
 
-  /** Bind the turn context (model registry, resolved vision model, abort signal)
-   *  for the loader's next dispatch. Called from every handler that may trigger
-   *  `loadDescription()`. */
+  /** Bind the turn context (model registry, resolved vision model, abort
+   *  signal) for the loader's next dispatch. Called from every handler that
+   *  may trigger `loadDescription()`.
+   *
+   *  The abort signal is forwarded into the loader's {@link turnAbortController}
+   *  rather than stored directly. Storing `ctx.signal` directly would leave a
+   *  prewarm-dispatched batch (started in `before_agent_start`, where
+   *  `ctx.signal` is `undefined` because the run hasn't started) with no abort
+   *  wire — ESC couldn't cancel it, so the `tool_result` handler would only
+   *  discard the result AFTER the vision call ran to completion. Forwarding
+   *  the live signal into a stable, loader-owned controller lets an in-flight
+   *  prewarm batch be aborted the moment the live signal arrives. */
   bindTurnContext(ctx: { modelRegistry: ModelRegistry; signal?: AbortSignal }): void {
     this.turnModelRegistry = ctx.modelRegistry;
-    this.turnSignal = ctx.signal;
     const resolved = this.deps.resolveVisionModel(ctx.modelRegistry, this.deps.getConfig().visionModel!);
     if (resolved) this.turnVisionModel = resolved;
+    const signal = ctx.signal;
+    if (!signal) return;
+    if (signal.aborted) {
+      this.turnAbortController.abort();
+      this.wiredSignal = signal;
+      return;
+    }
+    if (signal === this.wiredSignal) return; // already forwarded this signal
+    this.wiredSignal = signal;
+    signal.addEventListener("abort", () => this.turnAbortController.abort(), { once: true });
+  }
+
+  /** Reset the turn-level abort controller for a fresh turn. Call at turn
+   *  boundaries (`before_agent_start`, paste-time prewarm) so a previous turn's
+   *  cancel doesn't leave {@link turnAbortController} aborted — which would
+   *  make every subsequent dispatch short-circuit to UNAVAILABLE. A
+   *  non-aborted controller is reused (avoids orphaning an in-flight paste
+   *  prewarm holding its signal); only an aborted one is replaced. `wiredSignal`
+   *  is always cleared so the next live signal re-wires. Safe at a real turn
+   *  boundary, where the prior turn's batch has settled. */
+  resetTurnAbort(): void {
+    if (this.turnAbortController.signal.aborted) {
+      this.turnAbortController = new AbortController();
+    }
+    this.wiredSignal = undefined;
   }
 
   /** Capture this turn's user prompt so every image in the turn is described in
@@ -160,7 +209,9 @@ export class DescriptionLoader implements Disposable {
     this.dispatchScheduled = false;
     this.turnModelRegistry = null;
     this.turnVisionModel = null;
-    this.turnSignal = undefined;
+    // Fresh controller on session reset (no in-flight batch to orphan).
+    this.turnAbortController = new AbortController();
+    this.wiredSignal = undefined;
     this.pendingTurnPrompt = "";
   }
 
@@ -194,7 +245,7 @@ export class DescriptionLoader implements Disposable {
       for (const cb of batch.callbacks) cb.resolve(UNAVAILABLE);
       return;
     }
-    if (this.turnSignal?.aborted) {
+    if (this.turnAbortController.signal.aborted) {
       for (const key of batch.keys) this.cache.delete(key);
       for (const cb of batch.callbacks) cb.resolve(UNAVAILABLE);
       return;
@@ -209,7 +260,7 @@ export class DescriptionLoader implements Disposable {
       this.turnModelRegistry,
       cfg,
       this.deps,
-      this.turnSignal,
+      this.turnAbortController.signal,
     );
     // Build per-hash results, then fan them out to every callback. This reaches
     // duplicate-hash callbacks that a key-indexed loop would have skipped (and

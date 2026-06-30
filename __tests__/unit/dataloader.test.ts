@@ -185,3 +185,99 @@ describe("DescriptionLoader batching", () => {
     expect(da2).toBe(`[Image: desc-for-${hashOf(a)}]`); // duplicate resolved, not hung
   });
 });
+
+describe("DescriptionLoader turn-abort wiring", () => {
+  beforeEach(() => {
+    runBatch.mockClear();
+    describeSingle.mockClear();
+    runBatch.mockImplementation(async (misses: { hash: string }[]) => {
+      const out = new Map<string, string>();
+      for (const m of misses) out.set(m.hash, `desc-for-${m.hash}`);
+      return out;
+    });
+  });
+
+  it("short-circuits to UNAVAILABLE (no provider call) when the turn is already aborted at dispatch", async () => {
+    const loader = makeLoader();
+    const live = new AbortController();
+    loader.bindTurnContext({ modelRegistry: {} as any, signal: live.signal });
+    live.abort();
+    const out = await loader.loadDescription(img("AAA"));
+    expect(out).toBe(UNAVAILABLE);
+    expect(runBatch).not.toHaveBeenCalled();
+  });
+
+  it("makes a prewarm-dispatched batch abortable once a live signal is bound later", async () => {
+    // Reproduces the ESC-doesn't-abort bug. `before_agent_start` prewarms with
+    // ctx.signal === undefined (the agent run hasn't started, so no live abort
+    // signal exists yet). The dispatched batch must STILL become abortable once
+    // `tool_result`/`context` later bind the run's live signal — otherwise ESC
+    // can't cancel the in-flight vision call and only discards the result after
+    // it completes.
+    let resolveBatch!: (m: Map<string, string>) => void;
+    const inFlight = new Promise<Map<string, string>>((r) => {
+      resolveBatch = r;
+    });
+    // Keep the impl signature matching the mock (1 param); read the 7th arg
+    // (turnSignal) back from the recorded call so the in-flight batch's signal
+    // can be inspected after dispatch.
+    runBatch.mockImplementation(async (_misses: { hash: string }[]) => inFlight);
+
+    const loader = makeLoader();
+    // before_agent_start: bind with NO signal, then prewarm.
+    loader.resetTurnAbort();
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    const descPromise = loader.loadDescription(img("AAA"));
+    // Let the setImmediate dispatch fire so runBatch is in flight, holding the
+    // loader's turnAbortController.signal.
+    await new Promise((r) => setImmediate(r));
+
+    const capturedSignal = (runBatch.mock.calls as unknown[][])[0]?.[6] as AbortSignal | undefined;
+    // In flight, not yet aborted (no live signal wired).
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // tool_result: the run has started; bind the LIVE signal.
+    const live = new AbortController();
+    loader.bindTurnContext({ modelRegistry: {} as any, signal: live.signal });
+
+    // User presses ESC → run signal aborts → forwarded into the loader's
+    // controller → the signal the in-flight batch holds is now aborted.
+    live.abort();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    // The batch settles (the real runBatch would have aborted completeSimple);
+    // an empty result evicts the key and resolves UNAVAILABLE.
+    resolveBatch(new Map<string, string>());
+    const out = await descPromise;
+    expect(out).toBe(UNAVAILABLE);
+  });
+
+  it("resetTurnAbort() recovers from a previous turn's cancel so the next prewarm isn't skipped", async () => {
+    const loader = makeLoader();
+    const live = new AbortController();
+    loader.resetTurnAbort();
+    loader.bindTurnContext({ modelRegistry: {} as any, signal: live.signal });
+    live.abort(); // previous turn ESC'd → turnAbortController aborted
+
+    // Next turn: resetTurnAbort (as before_agent_start does), bind with no
+    // signal (prewarm), and load — must NOT short-circuit to UNAVAILABLE.
+    loader.resetTurnAbort();
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    const out = await loader.loadDescription(img("AAA"));
+    expect(out).not.toBe(UNAVAILABLE);
+    expect(runBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards the live signal at most once per signal across repeated binds", async () => {
+    const loader = makeLoader();
+    const live = new AbortController();
+    // tool_result and context both bind the same run signal in a turn.
+    loader.bindTurnContext({ modelRegistry: {} as any, signal: live.signal });
+    loader.bindTurnContext({ modelRegistry: {} as any, signal: live.signal });
+    live.abort();
+    // A second abort is a no-op; the loader's controller is aborted once.
+    const out = await loader.loadDescription(img("AAA"));
+    expect(out).toBe(UNAVAILABLE);
+    expect(runBatch).not.toHaveBeenCalled();
+  });
+});

@@ -144,6 +144,13 @@ function prewarmClipboardPath(path: string, modelRegistry: ModelRegistry): void 
   resolvePrewarmImage(read.buf, read.mimeType, resizeImage)
     .then((img) => {
       if (!img) return;
+      // Paste happens while the agent is idle (no run → no live signal).
+      // Reset the turn-abort controller so a previous turn's ESC doesn't leave
+      // it aborted and short-circuit this prewarm; the next submit's
+      // `before_agent_start` resets again. The prewarm batch uses the loader's
+      // controller and becomes abortable once a run starts and binds a live
+      // signal.
+      loader.resetTurnAbort();
       loader.setPendingTurnPrompt("");
       loader.bindTurnContext({ modelRegistry });
       loader.loadDescription(img).catch(() => {});
@@ -247,6 +254,18 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
+
+    // Fresh turn → fresh turn-abort controller. `before_agent_start` fires
+    // BEFORE the agent run starts, so `ctx.signal` is undefined here (the run's
+    // abort signal doesn't exist yet — it's created in `agent.prompt()` →
+    // `runWithLifecycle`, which runs AFTER this event). The prewarm below
+    // dispatches describer batches now, and they must be abortable once the
+    // run's live signal arrives — so reset the loader's turn-abort controller
+    // here, and let the later `tool_result`/`context` binds forward the live
+    // signal into it. Without this reset, a previous turn's ESC would leave
+    // the controller aborted and every dispatch would short-circuit to
+    // UNAVAILABLE.
+    loader.resetTurnAbort();
 
     // Capture this turn's user prompt so every image in the turn — attached or
     // read via the read tool — is described in the same request context.
