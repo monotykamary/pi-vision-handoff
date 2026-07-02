@@ -51,6 +51,7 @@ import {
 } from "./src/usage.js";
 import { DescriptionLoader, UNAVAILABLE, type LoaderDeps } from "./src/dataloader.js";
 import { imageHash, findClipboardImagePaths, readImageBuffer, resolvePrewarmImage } from "./src/image.js";
+import { appendVisionError } from "./src/error-log.js";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
 import { PrewarmEditor } from "./src/prewarm-editor.js";
@@ -194,14 +195,17 @@ function notifyUnresolvedVisionModel(ctx: ExtensionContext, ref: string): void {
   }
 }
 
-/** Notify once per failing image per session (dedup via warnedHashes). */
+/** Notify once per failing image per session (dedup via warnedHashes), and log
+ *  EVERY failure (even in headless/SDK mode with no UI) to the error log so the
+ *  user can troubleshoot. The log entry's `phase: "warn"` carries the failing
+ *  image hashes and the surfaced reason — when the reason is "unknown error",
+ *  the real cause lives in the matching `batch`/`single` entry for those hashes. */
 function warnFailedImages(
   ctx: ExtensionContext,
   imgs: ExtractedImage[],
   descs: string[],
   reason: string,
 ): void {
-  if (!ctx.hasUI) return;
   const newlyFailed: string[] = [];
   for (let i = 0; i < imgs.length; i++) {
     if (descs[i] === UNAVAILABLE) {
@@ -211,6 +215,17 @@ function warnFailedImages(
   }
   if (newlyFailed.length === 0) return;
   for (const h of newlyFailed) warnedHashes.add(h);
+  // Always log: troubleshooting must work in headless/SDK mode too, where the
+  // notify below never fires.
+  appendVisionError({
+    phase: "warn",
+    reason,
+    visionModel: config.visionModel,
+    imageHashes: newlyFailed,
+    imageCount: newlyFailed.length,
+    activeModel: ctx.model ? formatModelRef(ctx.model.provider, ctx.model.id) : undefined,
+  });
+  if (!ctx.hasUI) return;
   ctx.ui.notify(
     `pi-vision-handoff: image description failed — ${reason}. Vision model: ${config.visionModel}`,
     "warning",

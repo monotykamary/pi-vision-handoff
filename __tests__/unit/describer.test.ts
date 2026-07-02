@@ -1,5 +1,8 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Mock completeSimple() so the describer's stopReason handling is observable
 // without a provider. The describer routes through completeSimple (not
@@ -20,6 +23,34 @@ vi.mock("@earendil-works/pi-ai/compat", () => ({
 import { runBatch, describeSingle, resolveMaxTokens, type DescriberDeps } from "../../src/describer.js";
 import { DESCRIPTION_TRUNCATED_MARKER, type ExtractedImage, type VisionHandoffConfig } from "../../src/index.js";
 import { imageHash } from "../../src/image.js";
+import { getErrorLogPath, type VisionErrorLogEntry } from "../../src/error-log.js";
+
+// The describer now appends a structured error-log entry on every failure
+// (src/error-log.ts → ~/.pi/agent/logs/pi-vision-handoff/errors.log). Redirect
+// $PI_CODING_AGENT_DIR to a temp dir for every test so the suite never writes
+// to the user's real log, and so the wiring can be asserted by reading it back.
+let logDir: string;
+let savedEnv: string | undefined;
+beforeEach(() => {
+  logDir = mkdtempSync(join(tmpdir(), "pi-vh-desc-"));
+  savedEnv = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = logDir;
+});
+afterEach(() => {
+  if (savedEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = savedEnv;
+  rmSync(logDir, { recursive: true, force: true });
+});
+
+/** Read+parse the error log written this test (one entry per line). */
+function readLog(): VisionErrorLogEntry[] {
+  if (!existsSync(getErrorLogPath())) return [];
+  return readFileSync(getErrorLogPath(), "utf8")
+    .trimEnd()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as VisionErrorLogEntry);
+}
 
 const img = (data: string, mimeType = "image/png"): ExtractedImage => ({ data, mimeType });
 
@@ -297,5 +328,70 @@ describe("runBatch stopReason handling", () => {
     const out = await runBatch([{ img: a, hash: ha }], "", visionModel, modelRegistry, cfg, deps);
     expect(out.size).toBe(0);
     expect(deps.setLastError).toHaveBeenCalled();
+  });
+});
+
+describe("error logging (src/error-log.ts)", () => {
+  beforeEach(() => completeSimple.mockReset());
+
+  it("logs a batch entry on a stopReason error", async () => {
+    const a = img("AAA");
+    const ha = imageHash(a.mimeType, a.data);
+    completeSimple.mockResolvedValueOnce(fakeResponse({ stopReason: "error", errorMessage: "boom" }));
+    await runBatch([{ img: a, hash: ha }], "", visionModel, modelRegistry, cfg, makeDeps());
+    const entries = readLog();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].phase).toBe("batch");
+    expect(entries[0].stopReason).toBe("error");
+    expect(entries[0].reason).toContain("error");
+    expect(entries[0].reason).toContain("boom");
+    expect(entries[0].visionModel).toBe("p/id");
+    expect(entries[0].imageHashes).toEqual([ha]);
+    expect(entries[0].imageCount).toBe(1);
+    expect(entries[0].config?.thinking).toBe(false);
+  });
+
+  it("logs a single entry on an empty description", async () => {
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "", stopReason: "stop" }));
+    const a = img("AAA");
+    await describeSingle(a, "", visionModel, modelRegistry, cfg, makeDeps());
+    const entries = readLog();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].phase).toBe("single");
+    expect(entries[0].reason).toBe("vision model returned an empty description");
+    expect(entries[0].imageHashes).toEqual([imageHash(a.mimeType, a.data)]);
+  });
+
+  it("logs a single entry with a stack on a thrown error", async () => {
+    completeSimple.mockRejectedValueOnce(new Error("network down"));
+    await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, makeDeps());
+    const entries = readLog();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].phase).toBe("single");
+    expect(entries[0].reason).toBe("network down");
+    expect(entries[0].errorStack).toContain("network down");
+    expect(entries[0].timedOut).toBeFalsy();
+  });
+
+  it("logs an auth failure (no API key) with the provider error", async () => {
+    const failingRegistry = {
+      getApiKeyAndHeaders: async () => ({ ok: false, error: "missing API key" }),
+    } as any;
+    const a = img("AAA");
+    const ha = imageHash(a.mimeType, a.data);
+    await runBatch([{ img: a, hash: ha }], "", visionModel, failingRegistry, cfg, makeDeps());
+    const entries = readLog();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].phase).toBe("batch");
+    expect(entries[0].reason).toBe("missing API key");
+    expect(entries[0].imageHashes).toEqual([ha]);
+  });
+
+  it("does not log a deliberate user abort (a cancel isn't a troubleshooting error)", async () => {
+    completeSimple.mockRejectedValueOnce(new Error("aborted"));
+    const ac = new AbortController();
+    ac.abort();
+    await describeSingle(img("AAA"), "", visionModel, modelRegistry, cfg, makeDeps(), ac.signal);
+    expect(readLog()).toHaveLength(0);
   });
 });

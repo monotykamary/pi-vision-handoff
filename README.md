@@ -45,6 +45,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 - **⚡ Pre-warmed at paste-enter** — the moment you press enter, `before_agent_start` scans the prompt for pasted clipboard image temp-file paths (pi writes pasted images to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the path as text), reads them, and kicks off the ONE batched vision call concurrent with the agent's first response — so by the time the agent reads the files, they're already cache hits.
 - **🚀 Paste-time prewarm (opt-in)** — `prewarmPastedImages` (off by default) wraps the editor so pasted clipboard images are described the *instant* their path lands in the prompt — before you hit enter — not at submit. The vision call starts concurrent with you typing your question. Tradeoff: the description is generated without your typed question as context (the question usually isn't entered yet at paste time), and a paste-then-abandon wastes one vision call. TUI only; inactive if another extension replaces the editor. Toggle with `/vision-handoff prewarm on`.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
+- **📋 Error logging** — every describer failure and every `image description failed` warning is appended as a JSONL line to `~/.pi/agent/logs/pi-vision-handoff/errors.log`, so a warning like `image description failed — unknown error` is troubleshootable: the detailed reason (exception stack, `stopReason`, config snapshot) is captured at the describer's failure source even when the in-memory error string was already reset by the time the warning fired. Size-capped with a single `.1` backup.
 - **📊 Usage reporting** — every real describer call reports model + tokens (and Neuralwatt energy/cost when the vision model is a Neuralwatt model), via `pi.appendEntry` + a `vision-handoff:usage` event for live consumers.
 - **🔧 Tunable** — cap description length (`maxDescriptionLines`; unbounded by default, so `read`'s native `ctrl+o` collapse handles compactness) and cache size, in the config file.
 
@@ -99,6 +100,20 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `userPromptPrefix` | _(built-in)_ | Override the prefix prepended to your original prompt. |
 
 > The config path uses pi's `getAgentDir()` — set `PI_CODING_AGENT_DIR` to relocate it.
+
+### Troubleshooting
+
+When handoff fails, pi shows a short warning like `pi-vision-handoff: image description failed — <reason>. Vision model: <model>`. The full detail is in the error log:
+
+```
+~/.pi/agent/logs/pi-vision-handoff/errors.log
+```
+
+(one JSON object per line; relocate via `PI_CODING_AGENT_DIR`). Each entry records the `phase` (`batch` / `single` = describer failure source, `warn` = the user-facing warning), the `reason`, the `visionModel`, the failing `imageHashes`, and — when applicable — the `stopReason`, `errorMessage`, `errorStack`, and a `config` snapshot (`maxTokens` / `thinking` / `thinkingLevel`).
+
+**`reason: "unknown error"`** in a `warn` entry means the engine's shared last-error string was already reset (typically a concurrent batch cleared it) by the time the warning fired — so the real cause isn't in the warning. Correlate it with the matching `batch`/`single` entry: match on the `imageHashes` (and the timestamp) to recover the actual exception/`stopReason`. Deliberate user cancels (ESC) are not logged — they aren't errors.
+
+The log is append-only and size-capped (10 MB, rotating to `errors.log.1`), so a runaway broken vision model can't fill the disk; truncate it any time.
 
 ## Installation
 
@@ -372,6 +387,7 @@ pnpm lint:dead     # Dead code detection (knip)
 │   ├── image.ts                  # Image hashing, MIME sniffing, clipboard-path reading
 │   ├── prewarm-editor.ts        # Opt-in paste-time prewarm CustomEditor wrapper (chains onChange)
 │   ├── dispose.ts                 # `Disposable` guard factories for `using` (fetch interceptor, timer, abort wire)
+│   ├── error-log.ts              # Best-effort JSONL error log → ~/.pi/agent/logs/pi-vision-handoff/errors.log
 │   ├── usage.ts                  # Describer usage + Neuralwatt energy capture, fetch interceptor
 │   └── vision-model-selector.ts  # Interactive picker TUI component
 ├── __tests__/unit/
@@ -379,8 +395,9 @@ pnpm lint:dead     # Dead code detection (knip)
 │   ├── usage.test.ts             # Energy parsing, usage records, concurrency-safe fetch routing
 │   ├── vision-handoff.test.ts    # Config, refs, image-block extraction, insertion, truncation, round-trip
 │   ├── dataloader.test.ts        # Batch coalescing, memoization, failure eviction, Disposable reset
-│   ├── describer.test.ts        # stopReason handling (length → truncation marker, aborted/error)
+│   ├── describer.test.ts        # stopReason handling (length → truncation marker, aborted/error), error-log wiring
 │   ├── image.test.ts             # MIME sniffing, clipboard-path confinement, file reading, diffPrewarmPaths
+│   ├── error-log.test.ts         # JSONL error log: path resolution, append, size-capped rotation, never-throws
 │   └── dispose.test.ts           # `using` guards: fetch refcount, timeout, abort-wire propagation
 ├── package.json
 ├── tsconfig.json
