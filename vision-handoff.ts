@@ -553,7 +553,7 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "  /vision-handoff enable         Enable vision handoff",
         "  /vision-handoff disable        Disable vision handoff (keeps configured model)",
         "  /vision-handoff auto <on|off>  Toggle automatic handoff for all non-vision models",
-        "  /vision-handoff thinking <off|minimal|low|medium|high|xhigh>",
+        "  /vision-handoff thinking <off|minimal|low|medium|high|xhigh|max>",
         "                               Set the vision describer's thinking effort (off = disabled)",
         "  /vision-handoff prewarm <on|off>",
         "                               Toggle describing pasted images at paste-time (opt-in, off by default)",
@@ -714,7 +714,7 @@ function handleThinkingSubcommand(ctx: ExtensionCommandContext, rest: string): v
   if (!arg) {
     ctx.ui.notify(
       `Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}.\n` +
-        `Usage: /vision-handoff thinking <off|minimal|low|medium|high|xhigh>`,
+        `Usage: /vision-handoff thinking <off|minimal|low|medium|high|xhigh|max>`,
       "info",
     );
     return;
@@ -725,7 +725,7 @@ function handleThinkingSubcommand(ctx: ExtensionCommandContext, rest: string): v
   }
   if (!isThinkingLevel(arg)) {
     ctx.ui.notify(
-      `Unknown thinking level: "${arg}". Use off, minimal, low, medium, high, or xhigh.`,
+      `Unknown thinking level: "${arg}". Use off, minimal, low, medium, high, xhigh, or max.`,
       "error",
     );
     return;

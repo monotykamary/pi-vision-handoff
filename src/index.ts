@@ -67,6 +67,7 @@ export const THINKING_LEVELS: readonly ThinkingLevel[] = [
   "medium",
   "high",
   "xhigh",
+  "max",
 ];
 
 /** Default thinking effort for the vision describer when thinking is enabled. */
