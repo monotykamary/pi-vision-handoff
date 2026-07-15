@@ -1,6 +1,6 @@
 {
   "name": "pi-vision-handoff",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Give text-only pi models vision — describe images with a vision model you pick via an interactive picker, then hand off the text description to non-vision models",
   "type": "module",
   "author": "Tom X Nguyen",
