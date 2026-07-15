@@ -56,18 +56,6 @@ import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
 import { PrewarmEditor } from "./src/prewarm-editor.js";
 
-/**
- * pi-fabric prepends this prefix to every nested tool-call id it generates
- * inside a fabric_exec run (one per pi.* invocation in full-code mode). The
- * LLM's own tool-call ids (e.g. openai "call_…", anthropic "toolu_…") never use
- * it, so a tool_result whose toolCallId starts with this prefix is a nested
- * fabric call whose result returns to the sandbox program — not the agent's
- * message context — so the context hook will never see its image blocks. We
- * therefore swap image→description inline in the tool_result handler for
- * nested calls. Mirror of pi-fabric's NESTED_TOOL_CALL_ID_PREFIX.
- */
-const FABRIC_NESTED_TOOL_CALL_ID_PREFIX = "fabric_";
-
 let config: VisionHandoffConfig = readConfig();
 
 /** Most recent describer failure message (auth error, network error, abort,
@@ -363,21 +351,15 @@ export default function (pi: ExtensionAPI) {
   // iteration, so reads completing together land in ONE batch and all resolve
   // together.
   //
-  // Two shapes of caller reach this handler:
-  //  • Normal flow — the agent called `read` directly, so this tool result IS
-  //    the agent's tool result. The `context` hook will swap image→text on the
-  //    LLM-bound clone, so here we only WARM the cache (during the free
-  //    tool-result phase) and strip pi's misleading non-vision note, KEEPING
-  //    the image block so kitty renders it inline and /resume retains it.
-  //  • pi-fabric full-code mode — `pi.read` runs NESTED inside fabric_exec, so
-  //    the result returns to the sandbox program, not the agent's message
-  //    context. The `context` hook never sees these image blocks, and the
-  //    nested result is transient (never rendered by kitty or stored in
-  //    /resume). So we SWAP image→description inline here, mirroring the
-  //    `context` handler, so the description becomes pi.read's return value:
-  //    pi-fabric's normalizeResult extracts the text and the text-only agent
-  //    receives the description instead of a dropped image block. Nested
-  //    fabric calls are tagged with a `fabric_`-prefixed toolCallId.
+  // Both a direct agent `read` and a NESTED `pi.read` inside fabric_exec reach
+  // this handler and take the SAME path: WARM the cache (during the free
+  // tool-result phase), strip pi's misleading non-vision note, and KEEP the
+  // image block so kitty renders it inline and /resume retains it. The
+  // `context` hook swaps image→description on the LLM-bound clone before the
+  // next turn, so the text-only agent receives the description as text. This
+  // holds for fabric too: pi-fabric re-attaches the nested read's image to the
+  // fabric_exec tool-result content, which IS the agent's message context — so
+  // the `context` hook sees and swaps it, exactly like a direct read.
   pi.on("tool_result", async (event, ctx) => {
     if (!isConfigured(config)) return;
     if (event.toolName !== "read") return;
@@ -416,47 +398,7 @@ export default function (pi: ExtensionAPI) {
 
     warnFailedImages(ctx, imgs, descs, lastDescriberError ?? "unknown error");
 
-    // pi-fabric full-code mode: swap image→description inline (see the header
-    // comment). The descriptions are already wrapped ([Image: …]) by the
-    // dataloader, so push them directly; strip pi's non-vision note from any
-    // surviving text blocks since the description replaces the omitted image.
-    if (
-      typeof event.toolCallId === "string" &&
-      event.toolCallId.startsWith(FABRIC_NESTED_TOOL_CALL_ID_PREFIX)
-    ) {
-      const descByHash = new Map<string, string>();
-      for (let i = 0; i < imgs.length; i++) {
-        descByHash.set(imageHash(imgs[i].mimeType, imgs[i].data), descs[i]);
-      }
-      const next: (TextContent | ImageContent)[] = [];
-      for (const block of content) {
-        const img = extractImageFromBlock(block);
-        if (img) {
-          next.push({
-            type: "text",
-            text: descByHash.get(imageHash(img.mimeType, img.data)) ?? UNAVAILABLE,
-          });
-          continue;
-        }
-        if (
-          block &&
-          typeof block === "object" &&
-          (block as { type: string }).type === "text" &&
-          typeof (block as { text: string }).text === "string" &&
-          (block as { text: string }).text.includes(NON_VISION_IMAGE_NOTE)
-        ) {
-          next.push({
-            type: "text",
-            text: stripNonVisionImageNote((block as { text: string }).text),
-          });
-        } else {
-          next.push(block as TextContent | ImageContent);
-        }
-      }
-      return { content: next };
-    }
-
-    // Normal flow: warm the cache (done above) and strip pi's
+    // Warm the cache (done above) and strip pi's
     // `[Current model does not support images…]` note from text blocks —
     // since the handoff replaces the image with a description in the
     // `context` hook, that note is misleading (the agent WILL receive the

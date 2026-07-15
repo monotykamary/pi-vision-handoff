@@ -31,7 +31,6 @@ vi.mock("../../src/index.js", async (importActual) => {
 });
 
 import factory from "../../vision-handoff.js";
-import { extractImageFromBlock } from "../../src/index.js";
 import { UNAVAILABLE } from "../../src/dataloader.js";
 
 interface CapturedPi {
@@ -81,7 +80,9 @@ const readImageResult = (data: string) => [
   imageContent(data),
 ];
 
-describe("pi-fabric codemode nested tool_result swap", () => {
+const ctxWithSignal = () => ({ ...sessionCtx(), signal: new AbortController().signal });
+
+describe("pi-fabric codemode nested tool_result + context hook", () => {
   beforeEach(() => {
     runBatch.mockClear();
     describeSingle.mockClear();
@@ -92,28 +93,29 @@ describe("pi-fabric codemode nested tool_result swap", () => {
     });
   });
 
-  it("replaces image blocks with descriptions for a fabric_ nested call", async () => {
+  it("keeps the image block for a fabric_ nested call (the context hook swaps for the model)", async () => {
     const { handlers } = setup();
     await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
 
-    const event = {
-      type: "tool_result",
-      toolName: "read",
-      toolCallId: "fabric_abc-123",
-      input: { path: "x.png" },
-      content: readImageResult("AAA") as any,
-      isError: false,
-    };
-    const result = (await handlers["tool_result"](event, {
-      ...sessionCtx(),
-      signal: new AbortController().signal,
-    })) as { content: Array<{ type: string; text?: string }> } | undefined;
+    const result = (await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "fabric_abc-123",
+        input: { path: "x.png" },
+        content: readImageResult("AAA") as any,
+        isError: false,
+      },
+      ctxWithSignal(),
+    )) as { content: Array<{ type: string; text?: string }> } | undefined;
 
     expect(result).toBeDefined();
-    expect(extractImageFromBlock(result!.content.find((b) => b.type === "image") ?? null)).toBeNull();
-    const descBlock = result!.content.find((b) => b.type === "text" && b.text?.startsWith("[Image: desc-for-"));
-    expect(descBlock).toBeDefined();
-    // The non-vision note is stripped from the surviving text block.
+    // The nested tool_result keeps the image (kitty render + /resume); the
+    // `context` hook swaps it for the description on the LLM-bound clone, so
+    // NO description text is injected here.
+    expect(result!.content.some((b) => b.type === "image")).toBe(true);
+    expect(result!.content.some((b) => b.text?.startsWith("[Image: desc-for-"))).toBe(false);
+    // pi's non-vision note is stripped from the surviving text block.
     expect(result!.content.some((b) => b.text?.includes("does not support images"))).toBe(false);
   });
 
@@ -121,66 +123,127 @@ describe("pi-fabric codemode nested tool_result swap", () => {
     const { handlers } = setup();
     await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
 
-    const event = {
-      type: "tool_result",
-      toolName: "read",
-      toolCallId: "call_abc-123",
-      input: { path: "x.png" },
-      content: readImageResult("BBB") as any,
-      isError: false,
-    };
-    const result = (await handlers["tool_result"](event, {
-      ...sessionCtx(),
-      signal: new AbortController().signal,
-    })) as { content: Array<{ type: string }> } | undefined;
+    const result = (await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "call_abc-123",
+        input: { path: "x.png" },
+        content: readImageResult("BBB") as any,
+        isError: false,
+      },
+      ctxWithSignal(),
+    )) as { content: Array<{ type: string }> } | undefined;
 
     expect(result).toBeDefined();
-    // Normal flow keeps the image (kitty render + /resume); only the note is stripped.
     expect(result!.content.some((b) => b.type === "image")).toBe(true);
     expect(result!.content.some((b) => (b as { text?: string }).text?.includes("does not support images"))).toBe(false);
   });
 
-  it("uses UNAVAILABLE when the describer fails for a nested call", async () => {
+  it("keeps the image when the describer fails for a nested call (UNAVAILABLE flows via the context hook)", async () => {
     runBatch.mockImplementation(async () => new Map());
     const { handlers } = setup();
     await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
 
-    const event = {
-      type: "tool_result",
-      toolName: "read",
-      toolCallId: "fabric_fail-1",
-      input: { path: "x.png" },
-      content: readImageResult("CCC") as any,
-      isError: false,
-    };
-    const result = (await handlers["tool_result"](event, {
-      ...sessionCtx(),
-      signal: new AbortController().signal,
-    })) as { content: Array<{ type: string; text?: string }> } | undefined;
+    const result = (await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "fabric_fail-1",
+        input: { path: "x.png" },
+        content: readImageResult("CCC") as any,
+        isError: false,
+      },
+      ctxWithSignal(),
+    )) as { content: Array<{ type: string; text?: string }> } | undefined;
 
     expect(result).toBeDefined();
-    expect(result!.content.some((b) => b.type === "image")).toBe(false);
-    expect(result!.content.some((b) => b.text === UNAVAILABLE)).toBe(true);
+    // The nested tool_result keeps the image even on describer failure; the
+    // `context` hook substitutes UNAVAILABLE on the LLM-bound clone (below).
+    expect(result!.content.some((b) => b.type === "image")).toBe(true);
+    expect(result!.content.some((b) => b.text === UNAVAILABLE)).toBe(false);
+  });
+
+  it("swaps the re-attached fabric_exec image for the description via the context hook", async () => {
+    const { handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    // Warm the cache via the nested tool_result (which keeps the image),
+    // mirroring how pi-fabric re-attaches the image to the fabric_exec
+    // tool-result content that the `context` hook then scans.
+    await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "fabric_abc-123",
+        input: { path: "x.png" },
+        content: readImageResult("AAA") as any,
+        isError: false,
+      },
+      ctxWithSignal(),
+    );
+
+    const messages = [
+      {
+        role: "toolResult",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          imageContent("AAA"),
+        ],
+      },
+    ];
+    const result = (await handlers["context"](
+      { type: "context", messages: messages as any },
+      ctxWithSignal(),
+    )) as { messages: Array<{ content: Array<{ type: string; text?: string }> }> } | undefined;
+
+    expect(result).toBeDefined();
+    const blocks = result!.messages[0]!.content;
+    // The image is swapped for the cached description on the LLM-bound clone.
+    expect(blocks.some((b) => b.type === "image")).toBe(false);
+    expect(blocks.some((b) => b.text?.startsWith("[Image: desc-for-"))).toBe(true);
+  });
+
+  it("substitutes UNAVAILABLE via the context hook when the describer fails", async () => {
+    runBatch.mockImplementation(async () => new Map());
+    const { handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    const messages = [
+      {
+        role: "toolResult",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          imageContent("ZZZ"),
+        ],
+      },
+    ];
+    const result = (await handlers["context"](
+      { type: "context", messages: messages as any },
+      ctxWithSignal(),
+    )) as { messages: Array<{ content: Array<{ type: string; text?: string }> }> } | undefined;
+
+    expect(result).toBeDefined();
+    const blocks = result!.messages[0]!.content;
+    expect(blocks.some((b) => b.type === "image")).toBe(false);
+    expect(blocks.some((b) => b.text === UNAVAILABLE)).toBe(true);
   });
 
   it("does nothing when handoff is not a target for the active model", async () => {
     const { handlers } = setup();
     await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
 
-    const event = {
-      type: "tool_result",
-      toolName: "read",
-      toolCallId: "fabric_abc-123",
-      input: { path: "x.png" },
-      content: readImageResult("DDD") as any,
-      isError: false,
-    };
-    // Vision-capable active model + autoHandoff => NOT a handoff target.
-    const result = (await handlers["tool_result"](event, {
-      ...sessionCtx(),
-      model: { provider: "agent", id: "vision-model", input: ["text", "image"] },
-      signal: new AbortController().signal,
-    })) as unknown;
+    const result = (await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "fabric_abc-123",
+        input: { path: "x.png" },
+        content: readImageResult("DDD") as any,
+        isError: false,
+      },
+      { ...sessionCtx(), model: { provider: "agent", id: "vision-model", input: ["text", "image"] }, signal: new AbortController().signal },
+    )) as unknown;
 
     expect(result).toBeUndefined();
     expect(runBatch).not.toHaveBeenCalled();
