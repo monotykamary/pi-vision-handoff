@@ -9,6 +9,8 @@ import {
   willBeResized,
   resolvePrewarmImage,
   readImageBuffer,
+  readImageBufferBounded,
+  isOmittedImageNote,
   findClipboardImagePaths,
   diffPrewarmPaths,
   imageHash,
@@ -309,6 +311,56 @@ describe("readImageBuffer", () => {
 
   it("returns null for a missing file", () => {
     expect(readImageBuffer(join(dir, "nope.png"))).toBeNull();
+  });
+});
+
+describe("isOmittedImageNote", () => {
+  it("matches a processImage-failure note (image detected, then omitted)", () => {
+    expect(
+      isOmittedImageNote(
+        "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]\n[Current model does not support images. The image will be omitted from this request.]",
+      ),
+    ).toBe(true);
+    expect(
+      isOmittedImageNote(
+        "Read image file [image/jpeg]\n[Image omitted: could not be converted to a supported inline image format.]",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not match a normal read result (image-block path)", () => {
+    expect(isOmittedImageNote("Read image file [image/png]\n[Image: original 10x10.]")).toBe(false);
+  });
+
+  it("does not match unrelated text", () => {
+    expect(isOmittedImageNote("just some code")).toBe(false);
+    expect(isOmittedImageNote("")).toBe(false);
+  });
+});
+
+describe("readImageBufferBounded", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-vh-bounded-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("reads a small PNG file within the size bound", () => {
+    const png = pngHeader(10, 10);
+    const path = join(dir, "img.png");
+    writeFileSync(path, png);
+    const out = readImageBufferBounded(path);
+    expect(out).toEqual({ buf: png, mimeType: "image/png" });
+  });
+
+  it("returns null for a non-image file (sniff fails)", () => {
+    const path = join(dir, "not.png");
+    writeFileSync(path, "plain text, not an image");
+    expect(readImageBufferBounded(path)).toBeNull();
+  });
+
+  it("returns null for a missing file", () => {
+    expect(readImageBufferBounded(join(dir, "nope.png"))).toBeNull();
   });
 });
 

@@ -66,6 +66,9 @@ export interface LoaderDeps extends DescriberDeps {
   getConfig(): VisionHandoffConfig;
   /** Resolve the configured vision model against a registry. */
   resolveVisionModel: VisionModelResolver;
+  /** Backoff (ms) before retrying a totally-failed describer batch. Defaults
+   *  to {@link DESCRIBE_RETRY_BACKOFF_MS} when unset; 0 skips the wait (tests). */
+  retryBackoffMs?: number;
 }
 
 /** Defer `fn` to the next check phase (`setImmediate`), so every
@@ -83,6 +86,31 @@ export interface LoaderDeps extends DescriberDeps {
  *  cascade (e.g. the clipboard pre-warm) still coalesce. */
 function enqueuePostPromiseJob(fn: () => void): void {
   setImmediate(fn);
+}
+
+/** Default backoff (ms) before retrying a totally-failed describer batch. A
+ *  short backoff covers a transient provider blip (network hiccup, momentary
+ *  429) without adding meaningful latency to the tool-result phase (free
+ *  time). Generous enough to let a rate-limited provider recover, short enough
+ *  that a genuinely broken vision model doesn't stall a turn. */
+const DESCRIBE_RETRY_BACKOFF_MS = 500;
+
+/** Resolve after `ms`, or immediately if `signal` is already aborted or aborts
+ *  during the wait. Used by the retry backoff so a user cancel (ESC) doesn't
+ *  wait the full backoff before the retry is skipped. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (ms <= 0 || signal.aborted) return resolve();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class DescriptionLoader implements Disposable {
@@ -253,7 +281,7 @@ export class DescriptionLoader implements Disposable {
     this.deps.setLastError(null); // clear before a fresh attempt
     const misses = batch.keys.map((k, i) => ({ hash: k, img: batch.imgs[i] }));
     const cfg = this.deps.getConfig();
-    const parsed = await runBatch(
+    let parsed = await runBatch(
       misses,
       this.pendingTurnPrompt,
       this.turnVisionModel,
@@ -262,6 +290,30 @@ export class DescriptionLoader implements Disposable {
       this.deps,
       this.turnAbortController.signal,
     );
+    // Retry once on a TOTAL batch failure (the batched call itself failed:
+    // auth, network, timeout, empty, or stopReason "error"). A transient blip
+    // would otherwise cost the agent a full turn — UNAVAILABLE this turn, not
+    // cached, re-attempted next turn. Retrying the whole batch recovers it
+    // within the same tool-result phase (free time). Skip when the turn was
+    // cancelled (ESC); an auth failure re-fails cheaply (runBatch re-checks the
+    // API key before the vision call), so no vision call is wasted on a
+    // permanent auth error. Partial failures (some images described) are left
+    // as-is — only a totally-empty result retries.
+    if (parsed.size === 0 && misses.length > 0 && !this.turnAbortController.signal.aborted) {
+      await sleep(this.deps.retryBackoffMs ?? DESCRIBE_RETRY_BACKOFF_MS, this.turnAbortController.signal);
+      if (!this.turnAbortController.signal.aborted) {
+        this.deps.setLastError(null);
+        parsed = await runBatch(
+          misses,
+          this.pendingTurnPrompt,
+          this.turnVisionModel,
+          this.turnModelRegistry,
+          cfg,
+          this.deps,
+          this.turnAbortController.signal,
+        );
+      }
+    }
     // Build per-hash results, then fan them out to every callback. This reaches
     // duplicate-hash callbacks that a key-indexed loop would have skipped (and
     // left hanging).

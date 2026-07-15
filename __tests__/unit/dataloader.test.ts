@@ -87,18 +87,47 @@ describe("DescriptionLoader batching", () => {
     expect(runBatch.mock.calls.length).toBe(callsBefore);
   });
 
-  it("resolves UNAVAILABLE and evicts the cache on a failed batch, so the next turn re-attempts", async () => {
-    const loader = makeLoader();
+  it("retries a totally-failed batch once, recovering a transient blip in the same turn", async () => {
+    const loader = makeLoader({ retryBackoffMs: 0 });
     loader.bindTurnContext({ modelRegistry: {} as any });
     const a = img("AAA");
 
-    runBatch.mockResolvedValueOnce(new Map<string, string>());
+    runBatch.mockResolvedValueOnce(new Map<string, string>()); // first call fails
+    const out = await loader.loadDescription(a);
+    expect(out).not.toBe(UNAVAILABLE);
+    expect(runBatch).toHaveBeenCalledTimes(2); // initial + 1 retry
+  });
+
+  it("resolves UNAVAILABLE and evicts the cache when the retry also fails, so the next turn re-attempts", async () => {
+    const loader = makeLoader({ retryBackoffMs: 0 });
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    const a = img("AAA");
+
+    runBatch.mockResolvedValue(new Map<string, string>()); // both attempts fail
     const first = await loader.loadDescription(a);
     expect(first).toBe(UNAVAILABLE);
-    // failed → not cached: a fresh load triggers a new batch
+    expect(runBatch).toHaveBeenCalledTimes(2); // initial + 1 retry, no more
+    // failed → not cached: a fresh load triggers a new batch (with its own retry)
+    const callsBefore = runBatch.mock.calls.length;
     const second = await loader.loadDescription(a);
-    expect(second).not.toBe(UNAVAILABLE);
-    expect(runBatch.mock.calls.length).toBe(2);
+    expect(second).toBe(UNAVAILABLE);
+    expect(runBatch.mock.calls.length).toBe(callsBefore + 2);
+  });
+
+  it("skips the retry when the turn is aborted during the failed attempt", async () => {
+    const loader = makeLoader({ retryBackoffMs: 0 });
+    const live = new AbortController();
+    loader.bindTurnContext({ modelRegistry: {} as any, signal: live.signal });
+    const a = img("AAA");
+
+    // The failed attempt aborts the turn; the retry must be skipped (no 2nd call).
+    runBatch.mockImplementation(async () => {
+      live.abort();
+      return new Map<string, string>();
+    });
+    const out = await loader.loadDescription(a);
+    expect(out).toBe(UNAVAILABLE);
+    expect(runBatch).toHaveBeenCalledTimes(1);
   });
 
   it("clears the last error before each fresh attempt", async () => {

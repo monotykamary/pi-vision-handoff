@@ -8,6 +8,12 @@ const runBatch = vi.fn(async (misses: { hash: string }[]) => {
   return out;
 });
 const describeSingle = vi.fn(async (img: { data: string }) => `single-${img.data}`);
+const { readImageBufferBoundedMock } = vi.hoisted(() => ({
+  readImageBufferBoundedMock: vi.fn((): { buf: Buffer; mimeType: string } | null => ({
+    buf: Buffer.from("RECOVERED"),
+    mimeType: "image/png",
+  })),
+}));
 vi.mock("../../src/describer.js", () => ({
   runBatch: (...args: unknown[]) => runBatch(...(args as Parameters<typeof runBatch>)),
   describeSingle: (...args: unknown[]) => describeSingle(...(args as Parameters<typeof describeSingle>)),
@@ -28,6 +34,11 @@ vi.mock("../../src/index.js", async (importActual) => {
       prewarmPastedImages: false,
     }),
   };
+});
+
+vi.mock("../../src/image.js", async (importActual) => {
+  const actual = (await importActual()) as Record<string, unknown>;
+  return { ...actual, readImageBufferBounded: readImageBufferBoundedMock };
 });
 
 import factory from "../../vision-handoff.js";
@@ -245,6 +256,115 @@ describe("pi-fabric codemode nested tool_result + context hook", () => {
       { ...sessionCtx(), model: { provider: "agent", id: "vision-model", input: ["text", "image"] }, signal: new AbortController().signal },
     )) as unknown;
 
+    expect(result).toBeUndefined();
+    expect(runBatch).not.toHaveBeenCalled();
+  });
+});
+
+describe("omitted-image recovery (read emitted [Image omitted], no image block)", () => {
+  beforeEach(() => {
+    runBatch.mockClear();
+    describeSingle.mockClear();
+    runBatch.mockImplementation(async (misses: { hash: string }[]) => {
+      const out = new Map<string, string>();
+      for (const m of misses) out.set(m.hash, "desc-for-" + m.hash);
+      return out;
+    });
+    readImageBufferBoundedMock.mockClear();
+    readImageBufferBoundedMock.mockImplementation(() => ({ buf: Buffer.from("RECOVERED"), mimeType: "image/png" }));
+  });
+
+  it("re-reads the raw file and replaces the omitted note with the description", async () => {
+    const { handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    const omittedContent = [
+      {
+        type: "text",
+        text: "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]\n[Current model does not support images. The image will be omitted from this request.]",
+      },
+    ];
+    const result = (await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "call_omit-1",
+        input: { path: "/abs/x.png" },
+        content: omittedContent as any,
+        isError: false,
+      },
+      ctxWithSignal(),
+    )) as { content: Array<{ type: string; text?: string }> } | undefined;
+
+    expect(result).toBeDefined();
+    expect(readImageBufferBoundedMock).toHaveBeenCalledWith("/abs/x.png");
+    expect(result!.content.some((b) => b.text?.startsWith("[Image: desc-for-"))).toBe(true);
+    expect(result!.content.some((b) => b.text?.includes("[Image omitted:"))).toBe(false);
+    expect(runBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves a relative read path against ctx.cwd", async () => {
+    const { handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    const omittedContent = [
+      { type: "text", text: "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]" },
+    ];
+    await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "call_omit-2",
+        input: { path: "rel/x.png" },
+        content: omittedContent as any,
+        isError: false,
+      },
+      { ...ctxWithSignal(), cwd: "/working/dir" },
+    );
+    expect(readImageBufferBoundedMock).toHaveBeenCalledWith("/working/dir/rel/x.png");
+  });
+
+  it("leaves the omitted note when the file can't be re-read (no path)", async () => {
+    const { handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    const omittedContent = [
+      { type: "text", text: "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]" },
+    ];
+    const result = await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "call_omit-3",
+        input: {},
+        content: omittedContent as any,
+        isError: false,
+      },
+      ctxWithSignal(),
+    );
+    expect(result).toBeUndefined();
+    expect(runBatch).not.toHaveBeenCalled();
+  });
+
+  it("leaves the omitted note when the re-read returns null (APNG/unsupported/too large)", async () => {
+    readImageBufferBoundedMock.mockImplementationOnce(() => null);
+    const { handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    const omittedContent = [
+      { type: "text", text: "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]" },
+    ];
+    const result = await handlers["tool_result"](
+      {
+        type: "tool_result",
+        toolName: "read",
+        toolCallId: "call_omit-4",
+        input: { path: "/abs/x.png" },
+        content: omittedContent as any,
+        isError: false,
+      },
+      ctxWithSignal(),
+    );
     expect(result).toBeUndefined();
     expect(runBatch).not.toHaveBeenCalled();
   });

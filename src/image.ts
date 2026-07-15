@@ -18,7 +18,7 @@
  * agrees with pi on whether a file is an image at all.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, sep } from "node:path";
 import crypto from "node:crypto";
@@ -246,6 +246,40 @@ export function readImageBuffer(filePath: string): { buf: Buffer; mimeType: stri
   } catch {
     return null;
   }
+}
+
+/** Max raw file size the omitted-image recovery will re-read. pi's `read`
+ *  already read the file; this bounds the handoff's re-read so a pathologically
+ *  huge file doesn't double the memory. 20MB covers the most generous vision
+ *  model inline-image limit; a larger file would be rejected by the vision
+ *  model anyway. */
+export const MAX_RECOVER_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/** pi core's `read` tool emits this text note (with NO image block) when it
+ *  detected an image but `processImage` failed — Photon/WASM unavailable,
+ *  decode failure, convert-to-PNG failure, or couldn't resize below the inline
+ *  size limit. The handoff's image-block path never sees these (no image
+ *  block), so the image goes undescribed and the model is told the image was
+ *  "omitted". This detects that note so the tool_result handler can re-read the
+ *  raw file and describe its bytes directly (the vision model decodes them —
+ *  no Photon needed). */
+export function isOmittedImageNote(text: string): boolean {
+  return text.includes("Read image file [") && text.includes("[Image omitted:");
+}
+
+/** Read an image file for the omitted-image recovery, bounded by
+ *  {@link MAX_RECOVER_IMAGE_BYTES}. Returns null if the file can't be read, is
+ *  too large, or isn't a supported image (aligned with pi's sniff — APNG and
+ *  unsupported formats are rejected, since the vision model can't decode them
+ *  either). */
+export function readImageBufferBounded(filePath: string): { buf: Buffer; mimeType: string } | null {
+  try {
+    const stat = statSync(filePath);
+    if (stat.size > MAX_RECOVER_IMAGE_BYTES) return null;
+  } catch {
+    return null;
+  }
+  return readImageBuffer(filePath);
 }
 
 /** Regex matching pi's pasted-clipboard temp image file paths anywhere in the

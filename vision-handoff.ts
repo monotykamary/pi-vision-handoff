@@ -30,6 +30,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
+import { isAbsolute, resolve } from "node:path";
 import {
   extractImageFromBlock,
   formatModelRef,
@@ -50,7 +51,7 @@ import {
   type VisionHandoffUsageRecord,
 } from "./src/usage.js";
 import { DescriptionLoader, UNAVAILABLE, type LoaderDeps } from "./src/dataloader.js";
-import { imageHash, findClipboardImagePaths, readImageBuffer, resolvePrewarmImage } from "./src/image.js";
+import { imageHash, findClipboardImagePaths, readImageBuffer, readImageBufferBounded, resolvePrewarmImage, isOmittedImageNote } from "./src/image.js";
 import { appendVisionError } from "./src/error-log.js";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
@@ -368,13 +369,51 @@ export default function (pi: ExtensionAPI) {
 
     // Collect image blocks in this read result. (The read tool emits image
     // blocks even for non-vision models — they reach here untouched.)
+    if (!isHandoffTarget(ctx.model, config)) return;
     const imgs: ExtractedImage[] = [];
+    let hasImageBlock = false;
     for (const block of content) {
       const img = extractImageFromBlock(block);
-      if (img) imgs.push(img);
+      if (img) {
+        imgs.push(img);
+        hasImageBlock = true;
+      }
     }
+
+    // Fallback: `read` detected an image but `processImage` failed (Photon
+    // unavailable / decode fail / convert fail / couldn't resize below the
+    // inline limit), so it emitted a "[Image omitted: …]" text note with NO
+    // image block. The image-block path above never sees it, so the image
+    // would go undescribed and the model would be told the image was "omitted".
+    // Re-read the raw file and describe its bytes directly — the vision model
+    // decodes them itself (no Photon needed). This recovers the Photon-
+    // unavailable and under-vision-model-limit cases; APNG/unsupported are
+    // rejected by the sniff (the vision model can't decode them either).
+    let omittedNoteIndices: number[] = [];
+    if (!hasImageBlock) {
+      for (let i = 0; i < content.length; i++) {
+        const block = content[i];
+        if (
+          block &&
+          typeof block === "object" &&
+          (block as { type: string }).type === "text" &&
+          typeof (block as { text: string }).text === "string" &&
+          isOmittedImageNote((block as { text: string }).text)
+        ) {
+          omittedNoteIndices.push(i);
+        }
+      }
+      if (omittedNoteIndices.length > 0) {
+        const inputPath = event.input.path;
+        if (typeof inputPath === "string") {
+          const resolved = isAbsolute(inputPath) ? inputPath : resolve(ctx.cwd, inputPath);
+          const read = readImageBufferBounded(resolved);
+          if (read) imgs.push({ data: read.buf.toString("base64"), mimeType: read.mimeType });
+        }
+      }
+    }
+
     if (imgs.length === 0) return;
-    if (!isHandoffTarget(ctx.model, config)) return;
     loader.bindTurnContext(ctx);
     if (!resolveVisionModel(ctx.modelRegistry, config.visionModel!)) {
       notifyUnresolvedVisionModel(ctx, config.visionModel!);
@@ -397,6 +436,18 @@ export default function (pi: ExtensionAPI) {
     if (ctx.signal?.aborted) return;
 
     warnFailedImages(ctx, imgs, descs, lastDescriberError ?? "unknown error");
+
+    // Recovery path: no image block was emitted, so there's nothing for the
+    // `context` hook to swap. Replace each "[Image omitted: …]" note directly
+    // with its description (the recovered raw-bytes image is the only img here,
+    // so descs aligns 1:1 with omittedNoteIndices).
+    if (!hasImageBlock) {
+      const recovered = content.slice();
+      for (let i = 0; i < omittedNoteIndices.length && i < descs.length; i++) {
+        recovered[omittedNoteIndices[i]] = { type: "text", text: descs[i] };
+      }
+      return { content: recovered as (TextContent | ImageContent)[] };
+    }
 
     // Warm the cache (done above) and strip pi's
     // `[Current model does not support images…]` note from text blocks —
