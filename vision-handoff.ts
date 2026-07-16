@@ -816,6 +816,29 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
     .getAll()
     .map((m) => ({ provider: m.provider, id: m.id, name: m.name, input: m.input, reasoning: m.reasoning }));
 
+  if (ctx.mode !== "tui") {
+    const modelItems = ["None", ...allModels.map((m) => `${m.provider}/${m.id}`)];
+    const modelPick = await ctx.ui.select("Vision model", modelItems);
+    if (modelPick === undefined) return;
+    const ref = modelPick === "None" ? null : modelPick;
+    const thinkingPick = await ctx.ui.select("Thinking", ["on", "off"]);
+    if (thinkingPick === undefined) return;
+    const thinking = thinkingPick === "on";
+    const thinkingLevel = config.thinkingLevel;
+    const thinkingNote = thinking
+      ? `thinking on (${thinkingLevel})${ref ? " \u2014 applies only if the vision model supports reasoning" : ""}`
+      : "thinking off";
+    updateConfig(
+      ctx,
+      (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel }),
+      ref ? `Vision model set to ${ref} \u00b7 ${thinkingNote}` : `Vision model cleared \u00b7 ${thinkingNote}`,
+    );
+    if (!ref) {
+      ctx.ui.notify("Handoff is inactive until you pick a vision model.", "warning");
+    }
+    return;
+  }
+
   const result = await ctx.ui.custom<VisionModelSelectorResult>((tui, theme, _kb, done) => {
     const selector = new VisionModelSelectorComponent(
       theme,
