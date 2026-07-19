@@ -1,6 +1,6 @@
 /**
- * The vision describer: calls a vision-capable model via pi-ai's
- * `completeSimple()` to produce text descriptions of images.
+ * The vision describer calls a vision-capable model through its registered
+ * provider stream, falling back to pi-ai's `completeSimple()` for built-ins.
  *
  * `completeSimple` (not `complete`) is the path that translates the `reasoning`
  * ThinkingLevel into each provider's `reasoningEffort`/budget. `complete()` →
@@ -26,7 +26,17 @@
  * abort listener.
  */
 
-import type { Api, ImageContent, Message, Model, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  AssistantMessage,
+  Context,
+  ImageContent,
+  Message,
+  Model,
+  SimpleStreamOptions,
+  TextContent,
+  ThinkingLevel,
+} from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
@@ -117,6 +127,25 @@ function configSnapshot(cfg: VisionHandoffConfig): {
   return { maxTokens: cfg.maxTokens, thinking: cfg.thinking, thinkingLevel: cfg.thinkingLevel };
 }
 
+/** Complete through the provider registered in Pi's model registry when one
+ * supplies a custom stream. The post-0.80 ModelRuntime keeps extension streams
+ * out of pi-ai's deprecated global compatibility registry, so calling
+ * completeSimple() directly cannot resolve custom API ids such as `makora`.
+ * The optional access preserves compatibility with older ModelRegistry versions,
+ * which registered custom streams globally and do not expose the config getter. */
+export async function completeVisionModel(
+  model: Model<Api>,
+  modelRegistry: ModelRegistry,
+  context: Context,
+  options: SimpleStreamOptions,
+): Promise<AssistantMessage> {
+  const provider = modelRegistry.getRegisteredProviderConfig?.(model.provider);
+  if (provider?.streamSimple && provider.api === model.api) {
+    return provider.streamSimple(model, context, options).result();
+  }
+  return completeSimple(model, context, options);
+}
+
 /** Dependencies the describer can't own itself (held by the engine). */
 export interface DescriberDeps {
   /** Report a usage+energy record for one real describer call (cache hits emit none). */
@@ -189,8 +218,9 @@ export async function runBatch(
   const describeCtx: DescribeContext = { energyReader: undefined };
   try {
     const response = await describeAls.run(describeCtx, async () =>
-      completeSimple(
+      completeVisionModel(
         visionModel,
+        modelRegistry,
         { systemPrompt, messages: [userMessage] },
         { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens, reasoning },
       ),
@@ -360,8 +390,9 @@ export async function describeSingle(
   const describeCtx: DescribeContext = { energyReader: undefined };
   try {
     const response = await describeAls.run(describeCtx, async () =>
-      completeSimple(
+      completeVisionModel(
         visionModel,
+        modelRegistry,
         { systemPrompt, messages: [userMessage] },
         { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, maxTokens, reasoning },
       ),

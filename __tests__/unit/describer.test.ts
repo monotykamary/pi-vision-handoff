@@ -181,6 +181,46 @@ describe("thinking (reasoning) passthrough", () => {
   });
 });
 
+describe("provider routing", () => {
+  beforeEach(() => {
+    completeSimple.mockReset();
+    complete.mockReset();
+  });
+
+  it("uses a matching extension provider stream instead of the global compatibility registry", async () => {
+    const response = fakeResponse({ text: "custom provider description", stopReason: "stop" });
+    const result = vi.fn().mockResolvedValue(response);
+    const streamSimple = vi.fn((_model: unknown, _context: unknown, _options: unknown) => ({ result }));
+    const customRegistry = {
+      ...modelRegistry,
+      getRegisteredProviderConfig: vi.fn(() => ({ api: "custom-api", streamSimple })),
+    } as any;
+    const customModel = { ...visionModel, api: "custom-api" } as any;
+
+    const out = await describeSingle(img("AAA"), "", customModel, customRegistry, cfg, makeDeps());
+
+    expect(out).toBe("custom provider description");
+    expect(streamSimple).toHaveBeenCalledTimes(1);
+    expect(streamSimple.mock.calls[0][0]).toBe(customModel);
+    expect(streamSimple.mock.calls[0][2]).toMatchObject({ apiKey: "k", maxTokens: 4096 });
+    expect(result).toHaveBeenCalledTimes(1);
+    expect(completeSimple).not.toHaveBeenCalled();
+  });
+
+  it("falls back to completeSimple when no matching extension stream is registered", async () => {
+    completeSimple.mockResolvedValueOnce(fakeResponse({ text: "built-in description", stopReason: "stop" }));
+    const registry = {
+      ...modelRegistry,
+      getRegisteredProviderConfig: vi.fn(() => undefined),
+    } as any;
+
+    const out = await describeSingle(img("AAA"), "", visionModel, registry, cfg, makeDeps());
+
+    expect(out).toBe("built-in description");
+    expect(completeSimple).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("routes through completeSimple (not complete)", () => {
   // Regression guard: the describer used to call complete(), which silently
   // drops the `reasoning` ThinkingLevel — only completeSimple()/streamSimple()
