@@ -155,11 +155,7 @@ pi -e ./vision-handoff.ts
 
 ## How It Works
 
-The extension implements the **Facebook DataLoader pattern** for image
-descriptions. The `read` tools are the `load()` callers; a per-image cache
-memoizes promises; all `load()` calls in the same execution frame coalesce
-into ONE batched vision call, dispatched via `setImmediate` after the poll
-phase (so reads completing together batch instead of splitting into N calls).
+The extension implements the **Facebook DataLoader pattern** for image descriptions. The `read` tools are the `load()` callers; a per-image cache memoizes promises; all `load()` calls in the same execution frame coalesce into ONE batched vision call, dispatched via `setImmediate` after the poll phase (so reads completing together batch instead of splitting into N calls).
 
 With `prewarmPastedImages` on (opt-in), an even earlier stage runs:
 
@@ -224,93 +220,25 @@ The default submit-time pipeline below runs regardless:
           payload (`emitContext` does a `structuredClone`), leaving storage
           intact for kitty inline rendering and `/resume`
 
-Because the describer runs during the **tool-result phase** (before the
-agent's next turn), not during the `context` transform (the critical path
-right before the LLM call), the agent gets described text immediately when
-its turn starts — it never waits on the describer inline.
+Because the describer runs during the **tool-result phase** (before the agent's next turn), not during the `context` transform (the critical path right before the LLM call), the agent gets described text immediately when its turn starts — it never waits on the describer inline.
 
 ### Batching: the DataLoader
 
-A single frame's image set is described with **one** vision-model call, not
-one per image. `loadDescription(img)` is synchronous: on a cache miss it
-pushes the image's key (hash) into the current batch and returns a memoized
-promise; on a cache hit it returns the existing (in-flight or resolved)
-promise. `enqueuePostPromiseJob` schedules dispatch via `setImmediate` (the
-check phase, after the whole poll phase AND after the microtask queue
-drains), so every `load()` caller — whether from sync code, a `.then`
-cascade, or a separate I/O callback in the same poll iteration — registers
-its key before the single vision call fires. This is why N parallel reads
-coalesce into one call rather than splitting into N single-image calls:
-`setImmediate` defers past the entire poll phase, whereas DataLoader's
-classic `process.nextTick` would drain between the reads' I/O callbacks and
-fire a dispatch after the first read but before the second. The batched call
-sends every uncached image in a single user message with per-image
-`<<<IMAGE k>>> … <<<END>>>` delimiters; the response is parsed back into
-per-image descriptions (keyed by `sha256(mime + base64)` in the per-image
-cache). If the vision model ignores the delimiter format and the batched
-response can't be split, each unparsed image falls back to its own
-single-image `completeSimple()` call **in parallel** (no delimiters to cooperate
-with) — descriptions still arrive together. Only when a per-image call
-itself genuinely fails (auth, timeout, empty) does that image degrade to
-`[Image: description unavailable]`; one bad image never voids the rest.
+A single frame's image set is described with **one** vision-model call, not one per image. `loadDescription(img)` is synchronous: on a cache miss it pushes the image's key (hash) into the current batch and returns a memoized promise; on a cache hit it returns the existing (in-flight or resolved) promise. `enqueuePostPromiseJob` schedules dispatch via `setImmediate` (the check phase, after the whole poll phase AND after the microtask queue drains), so every `load()` caller — whether from sync code, a `.then` cascade, or a separate I/O callback in the same poll iteration — registers its key before the single vision call fires. This is why N parallel reads coalesce into one call rather than splitting into N single-image calls: `setImmediate` defers past the entire poll phase, whereas DataLoader's classic `process.nextTick` would drain between the reads' I/O callbacks and fire a dispatch after the first read but before the second. The batched call sends every uncached image in a single user message with per-image `<<<IMAGE k>>> … <<<END>>>` delimiters; the response is parsed back into per-image descriptions (keyed by `sha256(mime + base64)` in the per-image cache). If the vision model ignores the delimiter format and the batched response can't be split, each unparsed image falls back to its own single-image `completeSimple()` call **in parallel** (no delimiters to cooperate with) — descriptions still arrive together. Only when a per-image call itself genuinely fails (auth, timeout, empty) does that image degrade to `[Image: description unavailable]`; one bad image never voids the rest.
 
-Because pi runs parallel `read` tool calls via `Promise.all` and fires
-each read's `tool_result` event as that read's I/O completes (poll phase) —
-via `agent.afterToolCall` → `finalizeExecutedToolCall` — the loader's
-`setImmediate` dispatch defers to the check phase AFTER the whole poll
-iteration, so reads completing together share ONE batch → ONE vision call,
-all resolving together. Reads completing in separate poll iterations get
-separate calls, but always in parallel, never sequential. (The per-image
-cache also dedupes a duplicate `load()` of the same image in one frame:
-dispatch resolves every callback by hash, so a second load whose first cache
-entry was evicted mid-frame still resolves — it never hangs.)
+Because pi runs parallel `read` tool calls via `Promise.all` and fires each read's `tool_result` event as that read's I/O completes (poll phase) — via `agent.afterToolCall` → `finalizeExecutedToolCall` — the loader's `setImmediate` dispatch defers to the check phase AFTER the whole poll iteration, so reads completing together share ONE batch → ONE vision call, all resolving together. Reads completing in separate poll iterations get separate calls, but always in parallel, never sequential. (The per-image cache also dedupes a duplicate `load()` of the same image in one frame: dispatch resolves every callback by hash, so a second load whose first cache entry was evicted mid-frame still resolves — it never hangs.)
 
 **Failures are never cached.**
 
-**Failures are never cached.** A genuine describer failure returns
-`[Image: description unavailable]` for that turn but is NOT written to the
-per-image cache, so the next turn re-attempts (and surfaces the real error
-via a `ctx.ui.notify` warning instead of serving a stuck placeholder). This
-avoids a transient failure poisoning the cache for the rest of the session.
+**Failures are never cached.** A genuine describer failure returns `[Image: description unavailable]` for that turn but is NOT written to the per-image cache, so the next turn re-attempts (and surfaces the real error via a `ctx.ui.notify` warning instead of serving a stuck placeholder). This avoids a transient failure poisoning the cache for the rest of the session.
 
-**Per-image-set warning.** The `context` hook fires before every LLM turn,
-and describer failures aren't cached — so without dedup the same broken
-vision model would re-warn every turn. Each distinct image is warned about
-at most once per session (tracked by image hash, reset on `/resume`/new
-session); subsequent turns for the same failing image degrade silently to
-the placeholder instead of spamming.
+**Per-image-set warning.** The `context` hook fires before every LLM turn, and describer failures aren't cached — so without dedup the same broken vision model would re-warn every turn. Each distinct image is warned about at most once per session (tracked by image hash, reset on `/resume`/new session); subsequent turns for the same failing image degrade silently to the placeholder instead of spamming.
 
-**Timeout scales with batch size.** The describer generates an exhaustive
-multi-paragraph description per image, and the call is batched (N images →
-1 request). The timeout is `DESCRIBE_TIMEOUT_MS` (120s) plus a per-image
-budget (45s × (imageCount − 1)), so a 5-image batch isn't held to the same
-wall-clock budget as one image. A timeout surfaces as `describer timed out
-after <N>s` rather than a misleading `stopReason "aborted"`.
+**Timeout scales with batch size.** The describer generates an exhaustive multi-paragraph description per image, and the call is batched (N images → 1 request). The timeout is `DESCRIBE_TIMEOUT_MS` (120s) plus a per-image budget (45s × (imageCount − 1)), so a 5-image batch isn't held to the same wall-clock budget as one image. A timeout surfaces as `describer timed out after <N>s` rather than a misleading `stopReason "aborted"`.
 
-**No silent truncation.** The describer prompt says "be exhaustive", so the
-default `maxTokens` is **unset** — the describer uses the vision model's
-declared max output (`model.maxTokens`) as the cap, rather than relying on a
-provider's small omitted-default. That value is clamped so `maxTokens + 8192
-<= contextWindow`: a model whose declared `maxTokens` equals its full
-`contextWindow` (e.g. a custom provider that sets both to the same number)
-would otherwise be rejected by the provider with a 400 (you can't request
-output tokens equal to the entire context window when you also have input),
-so the clamp subtracts a small input reserve. If the model still hits a token
-limit (a cap you set, or the provider's hard output maximum), `stopReason`
-becomes `"length"`; the describer appends a visible
-`[... description truncated …]` marker to the (still useful) partial text
-rather than letting a cut-off description pass as complete. For a batched call
-the marker lands on the last image being emitted when the cap hit (the one cut
-off mid-stream); earlier sections had `<<<END>>>` delimiters and are complete.
+**No silent truncation.** The describer prompt says "be exhaustive", so the default `maxTokens` is **unset** — the describer uses the vision model's declared max output (`model.maxTokens`) as the cap, rather than relying on a provider's small omitted-default. That value is clamped so `maxTokens + 8192 <= contextWindow`: a model whose declared `maxTokens` equals its full `contextWindow` (e.g. a custom provider that sets both to the same number) would otherwise be rejected by the provider with a 400 (you can't request output tokens equal to the entire context window when you also have input), so the clamp subtracts a small input reserve. If the model still hits a token limit (a cap you set, or the provider's hard output maximum), `stopReason` becomes `"length"`; the describer appends a visible `[... description truncated …]` marker to the (still useful) partial text rather than letting a cut-off description pass as complete. For a batched call the marker lands on the last image being emitted when the cap hit (the one cut off mid-stream); earlier sections had `<<<END>>>` delimiters and are complete.
 
-**Aborts propagate.** The `context` hook runs in the foreground (pi awaits
-it before the LLM call), so a slow describer would also make aborting a turn
-slow — pi has to wait for the transform to return. The hook therefore wires
-the turn's abort signal (`ctx.signal`, the active run's `AbortController`)
-into the describer's `completeSimple()` call, so a user cancel kills the in-flight
-vision request immediately. A deliberate abort is not warned about (it's
-not a vision-model failure) and the LLM-bound payload is left untouched since
-the turn is being torn down anyway.
+**Aborts propagate.** The `context` hook runs in the foreground (pi awaits it before the LLM call), so a slow describer would also make aborting a turn slow — pi has to wait for the transform to return. The hook therefore wires the turn's abort signal (`ctx.signal`, the active run's `AbortController`) into the describer's `completeSimple()` call, so a user cancel kills the in-flight vision request immediately. A deliberate abort is not warned about (it's not a vision-model failure) and the LLM-bound payload is left untouched since the turn is being torn down anyway.
 
 ### Image-block formats handled
 
@@ -321,10 +249,7 @@ the turn is being torn down anyway.
 | `context` (all messages) | `{ type: "input_image", image_url: "data:…" }` (OpenAI Responses) | detected by shape → replaced with `{ type: "input_text", text }` |
 | `context` (all messages) | `{ type: "image", source: { type: "base64", media_type, data } }` (Anthropic Messages) | detected by shape → replaced with `{ type: "text", text }` |
 
-The describer call itself goes through pi's normal model machinery (`completeSimple()`),
-**not** the agent event loop — so it never re-triggers `context` (no recursion).
-The `read` tool result keeps its image block untouched (kitty inline + `/resume`);
-only the `context`-cloned LLM-bound payload has images swapped for text.
+The describer call itself goes through pi's normal model machinery (`completeSimple()`), **not** the agent event loop — so it never re-triggers `context` (no recursion). The `read` tool result keeps its image block untouched (kitty inline + `/resume`); only the `context`-cloned LLM-bound payload has images swapped for text.
 
 ### Usage reporting
 
@@ -407,11 +332,7 @@ pnpm lint:dead     # Dead code detection (knip)
 
 ## Acknowledgements
 
-The vision handoff concept and the exhaustive describer prompt originate from
-the [pi-umans-provider](https://github.com/monotykamary/pi-umans-provider) GLM 5.1
-pipeline. The picker TUI builds on the patterns from
-[pi-hide-providers](https://github.com/monotykamary/pi-hide-providers), which in
-turn mirror pi core's built-in selectors.
+The vision handoff concept and the exhaustive describer prompt originate from the [pi-umans-provider](https://github.com/monotykamary/pi-umans-provider) GLM 5.1 pipeline. The picker TUI builds on the patterns from [pi-hide-providers](https://github.com/monotykamary/pi-hide-providers), which in turn mirror pi core's built-in selectors.
 
 ## License
 
