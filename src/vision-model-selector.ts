@@ -48,6 +48,8 @@ export interface VisionModelSelectorResult {
   thinking: boolean;
   /** Thinking effort chosen in the picker. */
   thinkingLevel: ThinkingLevel;
+  /** Whether pasted paths should be injected if no matching read wins. */
+  asyncClipboardHandoff: boolean;
 }
 
 export class VisionModelSelectorComponent implements Component {
@@ -65,6 +67,7 @@ export class VisionModelSelectorComponent implements Component {
   private currentRef: string | null;
   private thinking: boolean;
   private thinkingLevel: ThinkingLevel;
+  private asyncClipboardHandoff: boolean;
 
   private _focused = false;
   get focused(): boolean {
@@ -87,6 +90,7 @@ export class VisionModelSelectorComponent implements Component {
     currentRef: string | null,
     currentThinking: boolean,
     currentThinkingLevel: ThinkingLevel,
+    currentAsyncClipboardHandoff: boolean,
     done: (result: VisionModelSelectorResult) => void,
   ) {
     this.theme = theme;
@@ -94,6 +98,7 @@ export class VisionModelSelectorComponent implements Component {
     this.currentRef = currentRef;
     this.thinking = currentThinking;
     this.thinkingLevel = currentThinkingLevel;
+    this.asyncClipboardHandoff = currentAsyncClipboardHandoff;
     this.allItems = this.buildItems(allModels);
     this.filteredItems = this.allItems;
 
@@ -180,6 +185,12 @@ export class VisionModelSelectorComponent implements Component {
       return;
     }
 
+    if (matchesKey(data, Key.ctrl("a"))) {
+      this.asyncClipboardHandoff = !this.asyncClipboardHandoff;
+      this.updateList();
+      return;
+    }
+
     // Thinking controls — reuse pi's own app.thinking.* keybindings so the
     // hints and behaviour match the rest of pi: ctrl+t toggles thinking
     // on/off, shift+tab cycles the effort level. Intercepted before the
@@ -263,6 +274,7 @@ export class VisionModelSelectorComponent implements Component {
       `ctrl+s done`,
       `${keyText("app.thinking.toggle")} thinking`,
       `${keyText("app.thinking.cycle")} effort`,
+      `ctrl+a async fallback`,
       `esc cancel`,
       this.searchInput.getValue() ? `${this.filteredItems.length - 1} match` : `${totalCount} models · ${visionCount} vision`,
     ];
@@ -365,6 +377,12 @@ export class VisionModelSelectorComponent implements Component {
         );
       }
       this.renderThinkingDetail(selected);
+      const fallback = this.asyncClipboardHandoff
+        ? this.theme.fg("success", "on")
+        : this.theme.fg("muted", "off");
+      this.listContainer.addChild(
+        new Text(this.theme.fg("dim", `  Async pasted-path fallback: ${fallback}`), 0, 0),
+      );
     }
 
     this.footerText.setText(this.getFooterText());
@@ -394,11 +412,23 @@ export class VisionModelSelectorComponent implements Component {
   }
 
   private confirm(item: DisplayItem): void {
-    this.done({ ref: item.ref, cancelled: false, thinking: this.thinking, thinkingLevel: this.thinkingLevel });
+    this.done({
+      ref: item.ref,
+      cancelled: false,
+      thinking: this.thinking,
+      thinkingLevel: this.thinkingLevel,
+      asyncClipboardHandoff: this.asyncClipboardHandoff,
+    });
   }
 
   private finish(cancelled: boolean): void {
-    this.done({ ref: null, cancelled, thinking: this.thinking, thinkingLevel: this.thinkingLevel });
+    this.done({
+      ref: null,
+      cancelled,
+      thinking: this.thinking,
+      thinkingLevel: this.thinkingLevel,
+      asyncClipboardHandoff: this.asyncClipboardHandoff,
+    });
   }
 
   /** Cycle the thinking effort forward through {@link THINKING_LEVELS},

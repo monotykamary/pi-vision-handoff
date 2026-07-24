@@ -11,6 +11,8 @@
  *   before_agent_start → warm the description cache for attached images AND
  *     pasted clipboard image file paths found in the prompt text (pre-warm at
  *     paste-enter, concurrent with the agent's first response).
+ *   optional async clipboard fallback → race matching read tool calls against a
+ *     non-blocking steering-message injection; matching reads cancel delivery.
  *   tool_result (read) → loadDescription() each read-tool image and AWAIT the
  *     shared batch, so N parallel reads coalesce into ONE vision call. The
  *     descriptions land in the tool results before the agent's next turn.
@@ -51,11 +53,12 @@ import {
   type VisionHandoffUsageRecord,
 } from "./src/usage.js";
 import { DescriptionLoader, UNAVAILABLE, type LoaderDeps } from "./src/dataloader.js";
-import { imageHash, findClipboardImagePaths, readImageBuffer, readImageBufferBounded, resolvePrewarmImage, isOmittedImageNote } from "./src/image.js";
+import { imageHash, findPastedImagePaths, readImageBuffer, readImageBufferBounded, resolvePrewarmImage, isOmittedImageNote } from "./src/image.js";
 import { appendVisionError } from "./src/error-log.js";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
 import { PrewarmEditor } from "./src/prewarm-editor.js";
+import { Text } from "@earendil-works/pi-tui";
 
 let config: VisionHandoffConfig = readConfig();
 
@@ -84,6 +87,110 @@ let editorInstalled = false;
 
 let visionModelCache: { ref: string; model: Model<Api> } | null = null;
 let visionModelUnresolvedRef: string | null = null;
+
+interface PendingAsyncClipboardHandoff {
+  token: symbol;
+  paths: Set<string>;
+  cancelled: boolean;
+}
+
+interface PreparedClipboardImage {
+  path: string;
+  image: ExtractedImage;
+  description: Promise<string>;
+}
+
+let pendingAsyncClipboardHandoff: PendingAsyncClipboardHandoff | null = null;
+
+function cancelAsyncClipboardHandoff(): void {
+  if (!pendingAsyncClipboardHandoff) return;
+  pendingAsyncClipboardHandoff.cancelled = true;
+  pendingAsyncClipboardHandoff = null;
+}
+
+function isPendingClipboardRead(input: unknown, cwd: string): boolean {
+  const pending = pendingAsyncClipboardHandoff;
+  if (!pending || !input || typeof input !== "object") return false;
+  const raw = (input as { path?: unknown }).path;
+  if (typeof raw !== "string") return false;
+  const path = raw.startsWith("@") ? raw.slice(1) : raw;
+  const absolute = isAbsolute(path) ? path : resolve(cwd, path);
+  return pending.paths.has(absolute);
+}
+
+function scheduleAsyncClipboardInjection(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  paths: string[],
+  prepared: Promise<PreparedClipboardImage | null>[],
+): void {
+  cancelAsyncClipboardHandoff();
+  const pending: PendingAsyncClipboardHandoff = {
+    token: Symbol("async-clipboard-handoff"),
+    paths: new Set(paths),
+    cancelled: false,
+  };
+  pendingAsyncClipboardHandoff = pending;
+
+  void (async () => {
+    const entries = (await Promise.all(prepared)).filter(
+      (entry): entry is PreparedClipboardImage => entry !== null,
+    );
+    if (entries.length === 0) {
+      if (pendingAsyncClipboardHandoff?.token === pending.token) {
+        pendingAsyncClipboardHandoff = null;
+      }
+      return;
+    }
+    const descriptions = await Promise.all(entries.map((entry) => entry.description));
+
+    // Always yield out of before_agent_start, even when paste-time prewarm made
+    // every description an immediate cache hit. This lets Pi enter the active
+    // agent run before sendMessage queues the fallback as a steering message.
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+    if (
+      pending.cancelled ||
+      pendingAsyncClipboardHandoff?.token !== pending.token ||
+      !config.asyncClipboardHandoff ||
+      !isConfigured(config)
+    ) {
+      return;
+    }
+
+    warnFailedImages(
+      ctx,
+      entries.map((entry) => entry.image),
+      descriptions,
+      lastDescriberError ?? "unknown error",
+    );
+    const content = [
+      "Asynchronous vision handoff for pasted image path(s):",
+      ...entries.map(
+        (entry, index) => `${entry.path}\n${descriptions[index] ?? UNAVAILABLE}`,
+      ),
+    ].join("\n\n");
+
+    pendingAsyncClipboardHandoff = null;
+    try {
+      pi.sendMessage(
+        {
+          customType: "vision-handoff-async",
+          content,
+          display: true,
+          details: { imageCount: entries.length },
+        },
+        { deliverAs: "steer", triggerTurn: true },
+      );
+    } catch {
+      // The session may have been replaced/reloaded while the description was
+      // in flight. The stale extension instance must not affect the new one.
+    }
+  })().catch(() => {
+    if (pendingAsyncClipboardHandoff?.token === pending.token) {
+      pendingAsyncClipboardHandoff = null;
+    }
+  });
+}
 
 // Usage reporter; wired to pi.appendEntry + pi.events.emit in the default
 // export. No-op until then so the describer is safe to call before wiring.
@@ -236,6 +343,24 @@ function warnFailedImages(
 export default function (pi: ExtensionAPI) {
   config = readConfig();
 
+  pi.registerMessageRenderer("vision-handoff-async", (message, { expanded }, theme) => {
+    const details = message.details as { imageCount?: number } | undefined;
+    const count = details?.imageCount ?? 1;
+    const label = `Vision handoff · ${count} pasted image${count === 1 ? "" : "s"}`;
+    const hint = expanded ? "Ctrl+O to collapse" : "Ctrl+O to expand";
+    const summary = theme.fg("dim", `👁 ${label} · ${hint}`);
+    if (!expanded) return new Text(summary, 0, 0);
+    // Apply the dim (grey) style per line: the TUI appends a full SGR reset at
+    // the end of each rendered line, so a single style wrapper would only tint
+    // the first line. Text wraps with wrapTextWithAnsi (ANSI-preserving), and
+    // each line here carries its own dim code so wrapped continuations stay grey.
+    const contentStr = typeof message.content === "string" ? message.content : "";
+    const body = contentStr.length > 0
+      ? contentStr.split("\n").map((line) => theme.fg("dim", line)).join("\n")
+      : "";
+    return new Text(body ? `${summary}\n${body}` : summary, 0, 0);
+  });
+
   // Wire the usage reporter to pi's persistence + event bus. appendEntry
   // persists the record so it replays on session resume/branch, and the event
   // lets live consumers filter on one channel for tokens AND energy. Each call
@@ -257,6 +382,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    cancelAsyncClipboardHandoff();
     // Reload in case the user edited the config on disk from another session.
     config = readConfig();
     visionModelCache = null;
@@ -268,6 +394,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    cancelAsyncClipboardHandoff();
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
 
@@ -298,9 +425,10 @@ export default function (pi: ExtensionAPI) {
     // 1. Attached image blocks (event.images) — vision-capable targets where
     //    the user message itself carries image blocks (e.g. `pi --image`).
     //
-    // 2. Pasted clipboard image FILE PATHS in the prompt text — the common
-    //    non-vision flow. pi's `handleClipboardImagePaste` writes each pasted
-    //    image to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the PATH as
+    // 2. Pasted image FILE PATHS in the prompt text — the common non-vision
+    //    flow. pi's `handleClipboardImagePaste` (and other paste mechanisms like
+    //    localterm-paste) write each pasted image to a temp file and insert the
+    //    PATH as
     //    text at the cursor; on a non-vision model these arrive as path tokens
     //    in `event.prompt`, NOT as `event.images`. We scan the prompt for those
     //    temp paths, read the files, and `loadDescription()` them so the ONE
@@ -331,15 +459,47 @@ export default function (pi: ExtensionAPI) {
     // describes an image the agent will see). A file that can't be read, isn't
     // a supported image, or fails to resize is skipped (the agent's `read`
     // will still describe it via `tool_result` if it emits an image block).
-    for (const p of findClipboardImagePaths(event.prompt || "")) {
-      const read = readImageBuffer(p);
-      if (!read) continue;
-      resolvePrewarmImage(read.buf, read.mimeType, resizeImage)
-        .then((img) => {
-          if (img) loader.loadDescription(img).catch(() => {});
-        })
-        .catch(() => {});
+    const clipboardPaths = findPastedImagePaths(event.prompt || "");
+    const preparedClipboardImages = clipboardPaths.map(
+      async (path): Promise<PreparedClipboardImage | null> => {
+        try {
+          const read = readImageBuffer(path);
+          if (!read) return null;
+          const image = await resolvePrewarmImage(read.buf, read.mimeType, resizeImage);
+          if (!image) return null;
+          const description = loader.loadDescription(image);
+          description.catch(() => {});
+          return { path, image, description };
+        } catch {
+          return null;
+        }
+      },
+    );
+
+    if (config.asyncClipboardHandoff && clipboardPaths.length > 0) {
+      scheduleAsyncClipboardInjection(pi, ctx, clipboardPaths, preparedClipboardImages);
+    } else {
+      // Start every preparation task even when no consumer awaits it. Each task
+      // calls loadDescription as soon as resize completes, preserving the
+      // original fire-and-forget submit-time prewarm behavior.
+      for (const prepared of preparedClipboardImages) prepared.catch(() => {});
     }
+  });
+
+  // A direct read and a nested pi.read both emit a read tool_call. If it targets
+  // one of this turn's pasted clipboard paths before the async fallback is
+  // injected, the normal tool_result/context path wins and the queued custom
+  // message is cancelled. The in-flight description is deliberately retained:
+  // the read result reuses it as a cache/in-flight hit.
+  pi.on("tool_call", (event, ctx) => {
+    if (event.toolName !== "read" && event.toolName !== "pi.read") return;
+    if (isPendingClipboardRead(event.input, ctx.cwd)) {
+      cancelAsyncClipboardHandoff();
+    }
+  });
+
+  pi.on("session_shutdown", () => {
+    cancelAsyncClipboardHandoff();
   });
 
   // The PRIMARY injection point: the `read` tool's `tool_result` handler.
@@ -565,7 +725,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("vision-handoff", {
     description: HANDOFF_COMMAND_DESCRIPTION,
     getArgumentCompletions(prefix: string) {
-      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "prewarm", "add", "remove", "clear", "help"];
+      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "prewarm", "fallback", "add", "remove", "clear", "help"];
       const matches = subcommands.filter((s) => s.startsWith(prefix));
       return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
     },
@@ -601,6 +761,8 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "                               Set the vision describer's thinking effort (off = disabled)",
         "  /vision-handoff prewarm <on|off>",
         "                               Toggle describing pasted images at paste-time (opt-in, off by default)",
+        "  /vision-handoff fallback <on|off>",
+        "                               Inject pasted-image descriptions asynchronously when no matching read wins",
         "  /vision-handoff add <p/id>     Force handoff for an extra model",
         "  /vision-handoff remove <p/id>  Stop forcing handoff for a model",
         "  /vision-handoff clear          Clear the configured vision model",
@@ -611,6 +773,7 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "  read images through a dataloader (one batched vision call); context swaps",
         "  image blocks in the payload for the cached text description.",
         "  prewarm on wraps the editor to describe pasted images at paste-time.",
+        "  fallback on asynchronously injects a collapsed description unless a matching read wins.",
       ].join("\n"),
       "info",
     );
@@ -654,6 +817,11 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
 
   if (subcommand === "prewarm") {
     handlePrewarmSubcommand(ctx, rest);
+    return;
+  }
+
+  if (subcommand === "fallback") {
+    handleFallbackSubcommand(ctx, rest);
     return;
   }
 
@@ -743,6 +911,7 @@ function updateConfig(
   message: string,
 ): void {
   const next = transform(config);
+  if (!next.asyncClipboardHandoff) cancelAsyncClipboardHandoff();
   const path = writeConfig(next);
   config = next;
   visionModelCache = null;
@@ -806,6 +975,31 @@ function handlePrewarmSubcommand(ctx: ExtensionCommandContext, rest: string): vo
   updateConfig(ctx, (c) => ({ ...c, prewarmPastedImages: on }), note);
 }
 
+/** Handle /vision-handoff fallback <on|off>. */
+function handleFallbackSubcommand(ctx: ExtensionCommandContext, rest: string): void {
+  const value = rest.trim().toLowerCase();
+  if (!value) {
+    ctx.ui.notify(
+      `Async pasted-path fallback: ${config.asyncClipboardHandoff ? "on" : "off"}.\n` +
+        "Usage: /vision-handoff fallback <on|off>",
+      "info",
+    );
+    return;
+  }
+  if (value !== "on" && value !== "off") {
+    ctx.ui.notify("Usage: /vision-handoff fallback <on|off>", "warning");
+    return;
+  }
+  const on = value === "on";
+  updateConfig(
+    ctx,
+    (c) => ({ ...c, asyncClipboardHandoff: on }),
+    on
+      ? "Async pasted-path fallback on — a matching read wins the race; otherwise the description is injected as a collapsed message."
+      : "Async pasted-path fallback off.",
+  );
+}
+
 async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify("/vision-handoff requires interactive mode.", "error");
@@ -825,12 +1019,15 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
     if (thinkingPick === undefined) return;
     const thinking = thinkingPick === "on";
     const thinkingLevel = config.thinkingLevel;
+    const fallbackPick = await ctx.ui.select("Async pasted-path fallback", ["on", "off"]);
+    if (fallbackPick === undefined) return;
+    const asyncClipboardHandoff = fallbackPick === "on";
     const thinkingNote = thinking
       ? `thinking on (${thinkingLevel})${ref ? " \u2014 applies only if the vision model supports reasoning" : ""}`
       : "thinking off";
     updateConfig(
       ctx,
-      (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel }),
+      (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel, asyncClipboardHandoff }),
       ref ? `Vision model set to ${ref} \u00b7 ${thinkingNote}` : `Vision model cleared \u00b7 ${thinkingNote}`,
     );
     if (!ref) {
@@ -846,6 +1043,7 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
       config.visionModel,
       config.thinking,
       config.thinkingLevel,
+      config.asyncClipboardHandoff,
       (r) => done(r),
     );
     return {
@@ -870,6 +1068,7 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   const ref = result.ref;
   const thinking = result.thinking;
   const thinkingLevel = result.thinkingLevel;
+  const asyncClipboardHandoff = result.asyncClipboardHandoff;
   // Fold the thinking state into the single updateConfig notify so the
   // "thinking off" message can't overwrite the model-change message.
   const thinkingNote = thinking
@@ -877,7 +1076,7 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
     : "thinking off";
   updateConfig(
     ctx,
-    (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel }),
+    (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel, asyncClipboardHandoff }),
     ref ? `Vision model set to ${ref} · ${thinkingNote}` : `Vision model cleared · ${thinkingNote}`,
   );
   if (!ref) {
@@ -893,6 +1092,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
   lines.push(`Handoff targets (explicit): ${config.handoffModels.length ? config.handoffModels.join(", ") : "(none)"}`);
   lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
   lines.push(`Paste-time prewarm: ${config.prewarmPastedImages ? `on${editorInstalled ? "" : " (inactive — another custom editor is active)"}` : "off"}`);
+  lines.push(`Async pasted-path fallback: ${config.asyncClipboardHandoff ? "on" : "off"}`);
   lines.push(`maxTokens: ${config.maxTokens ?? "unbounded"} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
 
   const model = ctx.model;

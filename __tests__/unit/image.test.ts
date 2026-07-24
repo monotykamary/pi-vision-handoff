@@ -11,7 +11,7 @@ import {
   readImageBuffer,
   readImageBufferBounded,
   isOmittedImageNote,
-  findClipboardImagePaths,
+  findPastedImagePaths,
   diffPrewarmPaths,
   imageHash,
 } from "../../src/image.js";
@@ -364,38 +364,58 @@ describe("readImageBufferBounded", () => {
   });
 });
 
-// ── findClipboardImagePaths ──────────────────────────────────────────────────
+// ── findPastedImagePaths ──────────────────────────────────────────────────
 
-describe("findClipboardImagePaths", () => {
+describe("findPastedImagePaths", () => {
   const tmp = tmpdir();
 
   it("collects pi-clipboard temp paths inside the OS temp dir", () => {
-    const prompt = `Look at ${tmp}/pi-clipboard-abc-1.png and ${tmp}/pi-clipboard-def-2.jpg please`;
-    expect(findClipboardImagePaths(prompt).sort()).toEqual(
-      [`${tmp}/pi-clipboard-abc-1.png`, `${tmp}/pi-clipboard-def-2.jpg`].sort(),
-    );
+    const a = tmp + "/pi-clipboard-abc-1.png";
+    const b = tmp + "/pi-clipboard-def-2.jpg";
+    expect(findPastedImagePaths("Look at " + a + " and " + b + " please").sort()).toEqual([a, b].sort());
   });
 
-  it("rejects a clipboard-shaped path outside the temp dir (confinement)", () => {
-    expect(findClipboardImagePaths(`evil: /etc/pi-clipboard-evil.png`)).toEqual([]);
+  it("collects localterm-paste temp paths (not just pi-clipboard)", () => {
+    const p = tmp + "/localterm-paste/abc-123/pasted-1784890583347-3c6a26f2.png";
+    expect(findPastedImagePaths("describe " + p)).toEqual([p]);
   });
 
-  it("resolves a relative clipboard path against the temp dir", () => {
-    expect(findClipboardImagePaths(`see pi-clipboard-rel-3.gif`)).toEqual([
-      join(tmp, "pi-clipboard-rel-3.gif"),
+  it("collects any temp-dir image path regardless of filename prefix", () => {
+    const a = tmp + "/screenshot-2026.png";
+    const b = tmp + "/nested/dir/chart.gif";
+    expect(findPastedImagePaths("see " + a + " and " + b).sort()).toEqual([a, b].sort());
+  });
+
+  it("rejects an image path outside the temp dir (confinement)", () => {
+    expect(findPastedImagePaths("evil: /etc/screenshot-evil.png")).toEqual([]);
+    expect(findPastedImagePaths("see /Users/me/Desktop/photo.jpg")).toEqual([]);
+  });
+
+  it("skips URLs so they aren't mistaken for local files", () => {
+    expect(findPastedImagePaths("see https://example.com/foo.png and file:///tmp/x.png")).toEqual([]);
+  });
+
+  it("strips leading wrapping chars so parenthesized/markdown paths resolve", () => {
+    const p = tmp + "/pi-clipboard-wrap.png";
+    expect(findPastedImagePaths("see (" + p + ")")).toEqual([p]);
+    expect(findPastedImagePaths("![](" + p + ")")).toEqual([p]);
+  });
+
+  it("resolves a relative image path against the temp dir", () => {
+    expect(findPastedImagePaths("see rel-3.gif")).toEqual([
+      join(tmp, "rel-3.gif"),
     ]);
   });
 
   it("dedupes repeated paths", () => {
-    expect(findClipboardImagePaths(`${tmp}/pi-clipboard-dup.png ${tmp}/pi-clipboard-dup.png`)).toEqual([
-      `${tmp}/pi-clipboard-dup.png`,
-    ]);
+    const a = tmp + "/pi-clipboard-dup.png";
+    expect(findPastedImagePaths(a + " " + a)).toEqual([a]);
   });
 
   it("supports webp and jpeg extensions", () => {
-    expect(findClipboardImagePaths(`${tmp}/pi-clipboard-a.webp ${tmp}/pi-clipboard-b.jpeg`).sort()).toEqual(
-      [`${tmp}/pi-clipboard-a.webp`, `${tmp}/pi-clipboard-b.jpeg`].sort(),
-    );
+    const a = tmp + "/pi-clipboard-a.webp";
+    const b = tmp + "/pi-clipboard-b.jpeg";
+    expect(findPastedImagePaths(a + " " + b).sort()).toEqual([a, b].sort());
   });
 });
 

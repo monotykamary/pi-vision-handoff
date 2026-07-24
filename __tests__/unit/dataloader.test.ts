@@ -32,6 +32,7 @@ function makeLoader(
     autoHandoff: true,
     handoffModels: [],
     prewarmPastedImages: false,
+    asyncClipboardHandoff: false,
     maxTokens: undefined,
     cacheMax: 50,
     maxDescriptionLines: 0,

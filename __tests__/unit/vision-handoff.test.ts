@@ -151,6 +151,14 @@ describe("normalizeConfig", () => {
     expect(normalizeConfig({ prewarmPastedImages: null }).prewarmPastedImages).toBe(false);
   });
 
+  it("asyncClipboardHandoff defaults to false and accepts only booleans", () => {
+    expect(DEFAULT_CONFIG.asyncClipboardHandoff).toBe(false);
+    expect(normalizeConfig({}).asyncClipboardHandoff).toBe(false);
+    expect(normalizeConfig({ asyncClipboardHandoff: true }).asyncClipboardHandoff).toBe(true);
+    expect(normalizeConfig({ asyncClipboardHandoff: false }).asyncClipboardHandoff).toBe(false);
+    expect(normalizeConfig({ asyncClipboardHandoff: "yes" }).asyncClipboardHandoff).toBe(false);
+  });
+
   it("thinking accepts a boolean on/off and a valid level", () => {
     const cfg = normalizeConfig({ thinking: true, thinkingLevel: "high" });
     expect(cfg.thinking).toBe(true);

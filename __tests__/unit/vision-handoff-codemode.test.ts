@@ -8,11 +8,22 @@ const runBatch = vi.fn(async (misses: { hash: string }[]) => {
   return out;
 });
 const describeSingle = vi.fn(async (img: { data: string }) => `single-${img.data}`);
-const { readImageBufferBoundedMock } = vi.hoisted(() => ({
+const ASYNC_CLIPBOARD_PATH = "/tmp/pi-clipboard-async.png";
+const {
+  readImageBufferBoundedMock,
+  findPastedImagePathsMock,
+  readImageBufferMock,
+  resolvePrewarmImageMock,
+} = vi.hoisted(() => ({
   readImageBufferBoundedMock: vi.fn((): { buf: Buffer; mimeType: string } | null => ({
     buf: Buffer.from("RECOVERED"),
     mimeType: "image/png",
   })),
+  findPastedImagePathsMock: vi.fn((prompt: string) =>
+    prompt.includes("clipboard-image") ? ["/tmp/pi-clipboard-async.png"] : [],
+  ),
+  readImageBufferMock: vi.fn(() => ({ buf: Buffer.from("ASYNC"), mimeType: "image/png" })),
+  resolvePrewarmImageMock: vi.fn(async () => ({ data: "ASYNC", mimeType: "image/png" })),
 }));
 vi.mock("../../src/describer.js", () => ({
   runBatch: (...args: unknown[]) => runBatch(...(args as Parameters<typeof runBatch>)),
@@ -32,13 +43,20 @@ vi.mock("../../src/index.js", async (importActual) => {
       autoHandoff: true,
       handoffModels: [],
       prewarmPastedImages: false,
+      asyncClipboardHandoff: true,
     }),
   };
 });
 
 vi.mock("../../src/image.js", async (importActual) => {
   const actual = (await importActual()) as Record<string, unknown>;
-  return { ...actual, readImageBufferBounded: readImageBufferBoundedMock };
+  return {
+    ...actual,
+    readImageBufferBounded: readImageBufferBoundedMock,
+    findPastedImagePaths: findPastedImagePathsMock,
+    readImageBuffer: readImageBufferMock,
+    resolvePrewarmImage: resolvePrewarmImageMock,
+  };
 });
 
 import factory from "../../vision-handoff.js";
@@ -47,6 +65,8 @@ import { UNAVAILABLE } from "../../src/dataloader.js";
 interface CapturedPi {
   on: ReturnType<typeof vi.fn>;
   registerCommand: ReturnType<typeof vi.fn>;
+  registerMessageRenderer: ReturnType<typeof vi.fn>;
+  sendMessage: ReturnType<typeof vi.fn>;
   appendEntry: ReturnType<typeof vi.fn>;
   events: { emit: ReturnType<typeof vi.fn> };
   getActiveTools: () => string[];
@@ -59,6 +79,8 @@ const setup = (): { pi: CapturedPi; handlers: Record<string, (event: any, ctx: a
       handlers[event] = handler;
     }),
     registerCommand: vi.fn(),
+    registerMessageRenderer: vi.fn(),
+    sendMessage: vi.fn(),
     appendEntry: vi.fn(),
     events: { emit: vi.fn() },
     getActiveTools: () => [],
@@ -258,6 +280,119 @@ describe("pi-fabric codemode nested tool_result + context hook", () => {
 
     expect(result).toBeUndefined();
     expect(runBatch).not.toHaveBeenCalled();
+  });
+});
+
+const flushAsyncHandoff = async () => {
+  for (let i = 0; i < 4; i++) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+};
+
+describe("async pasted-path fallback race", () => {
+  beforeEach(() => {
+    runBatch.mockClear();
+    runBatch.mockImplementation(async (misses: { hash: string }[]) => {
+      const out = new Map<string, string>();
+      for (const miss of misses) out.set(miss.hash, `desc-for-${miss.hash}`);
+      return out;
+    });
+    findPastedImagePathsMock.mockClear();
+    readImageBufferMock.mockClear();
+    resolvePrewarmImageMock.mockClear();
+  });
+
+  it("injects a steering message when no matching read wins", async () => {
+    const { pi, handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    await handlers["before_agent_start"](
+      { type: "before_agent_start", prompt: "inspect clipboard-image", images: [] },
+      sessionCtx(),
+    );
+    await handlers["tool_call"](
+      { type: "tool_call", toolName: "fabric_exec", input: { code: "return 1" } },
+      ctxWithSignal(),
+    );
+    await flushAsyncHandoff();
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "vision-handoff-async",
+        content: expect.stringContaining("[Image: desc-for-"),
+        display: true,
+        details: { imageCount: 1 },
+      }),
+      { deliverAs: "steer", triggerTurn: true },
+    );
+  });
+
+  it("lets a nested pi.read of the pasted path cancel the fallback", async () => {
+    const { pi, handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    await handlers["before_agent_start"](
+      { type: "before_agent_start", prompt: "inspect clipboard-image", images: [] },
+      sessionCtx(),
+    );
+    await handlers["tool_call"](
+      { type: "tool_call", toolName: "fabric_exec", input: { code: "pi.read(...)" } },
+      ctxWithSignal(),
+    );
+    await handlers["tool_call"](
+      { type: "tool_call", toolName: "read", input: { path: ASYNC_CLIPBOARD_PATH } },
+      ctxWithSignal(),
+    );
+    await flushAsyncHandoff();
+
+    // Cancellation may beat the setImmediate DataLoader dispatch entirely or
+    // leave it running for the read result to reuse; only message injection is
+    // required to lose this race.
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel for a read of an unrelated path", async () => {
+    const { pi, handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    await handlers["before_agent_start"](
+      { type: "before_agent_start", prompt: "inspect clipboard-image", images: [] },
+      sessionCtx(),
+    );
+    await handlers["tool_call"](
+      { type: "tool_call", toolName: "pi.read", input: { path: "/tmp/unrelated.txt" } },
+      ctxWithSignal(),
+    );
+    await flushAsyncHandoff();
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders a dim summary until expanded, then dims the expanded body per line", () => {
+    const { pi } = setup();
+    const renderer = pi.registerMessageRenderer.mock.calls.find(
+      ([customType]) => customType === "vision-handoff-async",
+    )?.[1];
+    const fg = vi.fn((_color: string, text: string) => text);
+    const theme = { fg };
+    const message = {
+      content: "Asynchronous vision handoff\n[Image: detailed description]",
+      details: { imageCount: 1 },
+    };
+
+    const collapsed = renderer(message, { expanded: false }, theme).render(200).join("\n");
+    expect(collapsed).toContain("Ctrl+O to expand");
+    expect(collapsed).not.toContain("detailed description");
+
+    fg.mockClear();
+    const expanded = renderer(message, { expanded: true }, theme).render(200).join("\n");
+    expect(expanded).toContain("detailed description");
+    expect(expanded).toContain("Ctrl+O to collapse");
+    // The summary line and every content line are themed dim (grey), per line.
+    expect(fg).toHaveBeenCalledWith("dim", expect.stringContaining("Vision handoff"));
+    expect(fg).toHaveBeenCalledWith("dim", "Asynchronous vision handoff");
+    expect(fg).toHaveBeenCalledWith("dim", "[Image: detailed description]");
   });
 });
 

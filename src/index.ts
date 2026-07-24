@@ -149,6 +149,11 @@ export interface VisionHandoffConfig {
    *  a custom editor would break clipboard paste, since pi wires paste-image
    *  to the outermost editor only). */
   prewarmPastedImages: boolean;
+  /** Opt-in: asynchronously inject descriptions for pasted clipboard paths when
+   *  the target model does not read them. The normal read/tool_result path wins
+   *  the race: a matching read cancels the queued fallback injection while
+   *  reusing the same in-flight description. */
+  asyncClipboardHandoff: boolean;
   /** Max output tokens for a single description. `undefined` (default) = use the
    *  vision model's declared max output (`model.maxTokens`) as the cap — the
    *  highest the model supports — so the "be exhaustive" prompt isn't defeated
@@ -186,6 +191,7 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   autoHandoff: true,
   handoffModels: [],
   prewarmPastedImages: false,
+  asyncClipboardHandoff: false,
   maxTokens: undefined,
   cacheMax: DEFAULT_CACHE_MAX,
   maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
@@ -236,6 +242,9 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
       .filter((m) => m && parseModelRef(m));
   }
   if (typeof obj.prewarmPastedImages === "boolean") base.prewarmPastedImages = obj.prewarmPastedImages;
+  if (typeof obj.asyncClipboardHandoff === "boolean") {
+    base.asyncClipboardHandoff = obj.asyncClipboardHandoff;
+  }
   // maxTokens: optional. undefined (default) = no artificial cap. Only set when
   // a valid positive finite number is given; any other value leaves it unset.
   if (typeof obj.maxTokens === "number" && Number.isFinite(obj.maxTokens) && obj.maxTokens > 0) {

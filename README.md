@@ -42,8 +42,9 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 - **🔌 Provider-agnostic** — uses pi's own model execution machinery (`@earendil-works/pi-ai`'s `completeSimple()`), so it works with any provider/configured model, including custom provider extensions.
 - **🧠 Automatic targets** — by default, handoff applies to *every* model that lacks native vision. Opt out with `/vision-handoff auto off`.
 - **🗂️ Explicit overrides** — force handoff for specific models (e.g. a weak vision model) with `/vision-handoff add`.
-- **⚡ Pre-warmed at paste-enter** — the moment you press enter, `before_agent_start` scans the prompt for pasted clipboard image temp-file paths (pi writes pasted images to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the path as text), reads them, and kicks off the ONE batched vision call concurrent with the agent's first response — so by the time the agent reads the files, they're already cache hits.
+- **⚡ Pre-warmed at paste-enter** — the moment you press enter, `before_agent_start` scans the prompt for pasted image temp-file paths — pi-clipboard, localterm-paste, and any other paste mechanism that writes a pasted image to a temp file and inserts the path as text — reads them, and kicks off the ONE batched vision call concurrent with the agent's first response — so by the time the agent reads the files, they're already cache hits.
 - **🚀 Paste-time prewarm (opt-in)** — `prewarmPastedImages` (off by default) wraps the editor so pasted clipboard images are described the *instant* their path lands in the prompt — before you hit enter — not at submit. The vision call starts concurrent with you typing your question. Tradeoff: the description is generated without your typed question as context (the question usually isn't entered yet at paste time), and a paste-then-abandon wastes one vision call. TUI only; inactive if another extension replaces the editor. Toggle with `/vision-handoff prewarm on`.
+- **🏁 Async pasted-path fallback (opt-in)** — `asyncClipboardHandoff` races the normal read path against asynchronous delivery. A direct `read` or nested Fabric `pi.read` of the pasted path cancels the fallback and uses the normal tool-result/context flow; otherwise the completed description is queued as a steering message. Its transcript row is collapsed to one line by default and expands with `Ctrl+O`. Toggle it in the picker with `Ctrl+A` or run `/vision-handoff fallback on`.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
 - **📋 Error logging** — every describer failure and every `image description failed` warning is appended as a JSONL line to `~/.pi/agent/logs/pi-vision-handoff/errors.log`, so a warning like `image description failed — unknown error` is troubleshootable: the detailed reason (exception stack, `stopReason`, config snapshot) is captured at the describer's failure source even when the in-memory error string was already reset by the time the warning fired. Size-capped with a single `.1` backup.
 - **📊 Usage reporting** — every real describer call reports model + tokens (and Neuralwatt energy/cost when the vision model is a Neuralwatt model), via `pi.appendEntry` + a `vision-handoff:usage` event for live consumers.
@@ -62,6 +63,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 | `/vision-handoff enable` / `disable` | Master switch (keeps your configured model) |
 | `/vision-handoff auto on` / `off` | Toggle automatic handoff for all non-vision models |
 | `/vision-handoff prewarm on` / `off` | Toggle paste-time prewarm (opt-in, off by default) |
+| `/vision-handoff fallback on` / `off` | Race matching reads against async pasted-path description injection (opt-in) |
 | `/vision-handoff add ollama/llava:13b` | Force handoff for an extra model |
 | `/vision-handoff remove ollama/llava:13b` | Stop forcing handoff for a model |
 | `/vision-handoff clear` | Clear the configured vision model |
@@ -78,6 +80,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
   "autoHandoff": true,
   "handoffModels": ["ollama/llava:13b"],
   "prewarmPastedImages": false,
+  "asyncClipboardHandoff": false,
   "maxTokens": null,
   "cacheMax": 50,
   "maxDescriptionLines": 0,
@@ -93,6 +96,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `autoHandoff` | `true` | Apply handoff to every model whose `input` does not include `image`. |
 | `handoffModels` | `[]` | Extra `provider/id` refs that should also receive handoff. |
 | `prewarmPastedImages` | `false` | **Opt-in paste-time prewarm.** When `true`, a custom editor wrapper describes pasted clipboard images the instant their temp-file path lands in the prompt (pre-submit), instead of at submit. Trades a bit of description quality (the description is generated without your typed question as context, since the question usually isn't entered yet at paste time) and a speculative vision call on paste-then-abandon, for earlier prewarm. TUI mode only; inactive if another extension has replaced the editor. |
+| `asyncClipboardHandoff` | `false` | **Opt-in async fallback.** Starts from the existing submit-time prewarm. A matching direct `read` or Fabric-nested `pi.read` cancels message delivery; if no matching read wins, the description is queued asynchronously as a collapsed custom message and triggers/continues the agent turn. |
 | `maxTokens` | _(unset = model max, clamped to context window)_ | Cap on a single description's output. `null`/unset = use the vision model's declared max output (`model.maxTokens`), clamped so `maxTokens + 8192 <= contextWindow` (a model whose declared max equals its full context window would otherwise be rejected with a 400). Set a number only to cap cost/latency. A truncation is always surfaced via a `[... description truncated …]` marker when the model hits the limit, so a cut-off description is never mistaken for complete. |
 | `cacheMax` | `50` | Max described images kept in the in-memory cache per session. |
 | `maxDescriptionLines` | `0` | Cap on description lines (`0` = unbounded). Default keeps the full description so the `read` tool's native collapse (`ctrl+o`) handles compactness and the model gets complete context; setting `> 0` applies a lossy head-cap to both the TUI render and the model. |
@@ -175,6 +179,8 @@ With `prewarmPastedImages` on (opt-in), an even earlier stage runs:
           replaced the editor (installing over one would break paste, since
           pi wires paste-image to the outermost editor only)
 
+With `asyncClipboardHandoff` on, submit-time prewarm also schedules a non-blocking delivery race. A matching `read` tool call for the pasted path cancels only the custom-message injection (the in-flight description remains available to that read); if description delivery wins, Pi queues it as a steering message. The full description remains model-visible while the transcript shows a one-line row until `Ctrl+O` expands it.
+
 The default submit-time pipeline below runs regardless:
 
     → before_agent_start
@@ -183,9 +189,9 @@ The default submit-time pipeline below runs regardless:
         • PRE-WARMS at paste-enter via the loader, two sources coalescing into
           ONE batch:
           1. attached image blocks (event.images) — vision-capable targets
-          2. pasted clipboard image FILE PATHS in the prompt text — the common
-             non-vision flow: pi writes each pasted image to
-             `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the PATH as text
+          2. pasted image FILE PATHS in the prompt text — the common non-vision
+             flow: pi-clipboard, localterm-paste, and other paste mechanisms
+             write each pasted image to a temp file and insert the PATH as text
              at the cursor, so on a non-vision model they arrive as path tokens
              in `event.prompt`, NOT as `event.images`. The extension scans the
              prompt for those temp paths (confined to the OS temp dir — a
@@ -295,7 +301,7 @@ One record is emitted per **real** describer call (a batched call describing sev
 
 ```bash
 pnpm install
-pnpm test          # Vitest unit tests (77 passing)
+pnpm test          # Vitest unit tests
 pnpm typecheck     # TypeScript validation
 pnpm lint:dead     # Dead code detection (knip)
 ```
