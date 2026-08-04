@@ -206,6 +206,16 @@ function resolveVisionModel(modelRegistry: ModelRegistry, ref: string): Model<Ap
   return model;
 }
 
+/** True when the primary vision model resolves, or — failing that — at least
+ *  one configured fallback resolves. A broken primary ref (typo, removed
+ *  model) must not short-circuit the whole pipeline to "unresolved" warnings
+ *  when a fallback could still describe images; the loader's failover picks
+ *  the resolvable fallback up in bindTurnContext. */
+function isAnyVisionModelResolvable(modelRegistry: ModelRegistry, config: VisionHandoffConfig): boolean {
+  if (resolveVisionModel(modelRegistry, config.visionModel!)) return true;
+  return config.fallbackModels.some((ref) => resolveVisionModel(modelRegistry, ref));
+}
+
 const loaderDeps: LoaderDeps = {
   getConfig: () => config,
   resolveVisionModel,
@@ -415,7 +425,7 @@ export default function (pi: ExtensionAPI) {
     loader.setPendingTurnPrompt(event.prompt || "");
     loader.bindTurnContext(ctx);
 
-    if (!resolveVisionModel(ctx.modelRegistry, config.visionModel!)) {
+    if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
       notifyUnresolvedVisionModel(ctx, config.visionModel!);
       return;
     }
@@ -575,7 +585,7 @@ export default function (pi: ExtensionAPI) {
 
     if (imgs.length === 0) return;
     loader.bindTurnContext(ctx);
-    if (!resolveVisionModel(ctx.modelRegistry, config.visionModel!)) {
+    if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
       notifyUnresolvedVisionModel(ctx, config.visionModel!);
       return;
     }
@@ -667,7 +677,7 @@ export default function (pi: ExtensionAPI) {
     if (!anyImage) return;
     if (!isHandoffTarget(ctx.model, config)) return;
     loader.bindTurnContext(ctx);
-    if (!resolveVisionModel(ctx.modelRegistry, config.visionModel!)) {
+    if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
       notifyUnresolvedVisionModel(ctx, config.visionModel!);
       return;
     }

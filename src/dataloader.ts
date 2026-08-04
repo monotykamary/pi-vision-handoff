@@ -154,8 +154,23 @@ export class DescriptionLoader implements Disposable {
    *  prewarm batch be aborted the moment the live signal arrives. */
   bindTurnContext(ctx: { modelRegistry: ModelRegistry; signal?: AbortSignal }): void {
     this.turnModelRegistry = ctx.modelRegistry;
-    const resolved = this.deps.resolveVisionModel(ctx.modelRegistry, this.deps.getConfig().visionModel!);
-    if (resolved) this.turnVisionModel = resolved;
+    const cfg = this.deps.getConfig();
+    const resolved = this.deps.resolveVisionModel(ctx.modelRegistry, cfg.visionModel!);
+    if (resolved) {
+      this.turnVisionModel = resolved;
+    } else {
+      // Primary unresolvable (typo, removed model): pick the first resolvable
+      // fallback so failover still works instead of leaving the loader dead.
+      // Call-time failover in dispatchBatch covers the case where the primary
+      // RESOLVES but fails at call time.
+      for (const ref of cfg.fallbackModels ?? []) {
+        const fb = this.deps.resolveVisionModel(ctx.modelRegistry, ref);
+        if (fb) {
+          this.turnVisionModel = fb;
+          break;
+        }
+      }
+    }
     const signal = ctx.signal;
     if (!signal) return;
     if (signal.aborted) {
@@ -312,6 +327,34 @@ export class DescriptionLoader implements Disposable {
           this.deps,
           this.turnAbortController.signal,
         );
+      }
+    }
+    // Failover: the same-model retry failed too. Try each configured fallback
+    // describer in order (a different provider has independent rate limits /
+    // auth / availability). No per-fallback backoff — the fallback doesn't
+    // share the primary's rate-limit state. A partial result from any
+    // fallback wins; only when every fallback also returns empty do we give
+    // up (UNAVAILABLE, evicted from cache, re-attempted next turn). User
+    // cancel (ESC) skips failover.
+    if (parsed.size === 0 && misses.length > 0 && !this.turnAbortController.signal.aborted) {
+      for (const ref of cfg.fallbackModels ?? []) {
+        if (this.turnAbortController.signal.aborted) break;
+        const fallbackModel = this.deps.resolveVisionModel(this.turnModelRegistry, ref);
+        if (!fallbackModel) {
+          this.deps.setLastError(`fallback vision model "${ref}" could not be resolved`);
+          continue;
+        }
+        this.deps.setLastError(null);
+        parsed = await runBatch(
+          misses,
+          this.pendingTurnPrompt,
+          fallbackModel,
+          this.turnModelRegistry,
+          cfg,
+          this.deps,
+          this.turnAbortController.signal,
+        );
+        if (parsed.size > 0 || this.turnAbortController.signal.aborted) break;
       }
     }
     // Build per-hash results, then fan them out to every callback. This reaches

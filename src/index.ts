@@ -133,6 +133,13 @@ export interface VisionHandoffConfig {
   enabled: boolean;
   /** The vision-capable model that describes images, as "provider/id". null = not configured. */
   visionModel: string | null;
+  /** Optional fallback describers, tried in order when the primary vision
+   *  model's batched call fails entirely (auth, rate limit, timeout, network,
+   *  empty/error stopReason) and the same-model retry didn't recover.
+   *  Each entry is a "provider/id" ref; providers usually differ from the
+   *  primary so their rate limits / auth / availability are independent.
+   *  Empty (default) = no failover. */
+  fallbackModels: string[];
   /** When true (default), handoff is applied to every model whose input does not include "image". */
   autoHandoff: boolean;
   /** Extra "provider/id" refs that should ALSO receive handoff (e.g. weak vision models). */
@@ -188,6 +195,7 @@ export interface VisionHandoffConfig {
 export const DEFAULT_CONFIG: VisionHandoffConfig = {
   enabled: true,
   visionModel: null,
+  fallbackModels: [],
   autoHandoff: true,
   handoffModels: [],
   prewarmPastedImages: false,
@@ -232,6 +240,12 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
     base.visionModel = parseModelRef(obj.visionModel) ? obj.visionModel.trim() : null;
   } else if (obj.visionModel === null) {
     base.visionModel = null;
+  }
+  if (Array.isArray(obj.fallbackModels)) {
+    base.fallbackModels = obj.fallbackModels
+      .filter((m): m is string => typeof m === "string")
+      .map((m) => m.trim())
+      .filter((m) => m && parseModelRef(m));
   }
   if (typeof obj.autoHandoff === "boolean") base.autoHandoff = obj.autoHandoff;
 
