@@ -29,6 +29,7 @@ function makeLoader(
   const cfg: VisionHandoffConfig = {
     enabled: true,
     visionModel: "p/id",
+    fallbackModels: [],
     autoHandoff: true,
     handoffModels: [],
     prewarmPastedImages: false,

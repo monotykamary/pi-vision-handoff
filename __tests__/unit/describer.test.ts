@@ -70,6 +70,7 @@ function fakeResponse(opts: Partial<AssistantMessage> & { text?: string }): Assi
 const cfg: VisionHandoffConfig = {
   enabled: true,
   visionModel: "p/id",
+  fallbackModels: [],
   autoHandoff: true,
   handoffModels: [],
   prewarmPastedImages: false,
@@ -258,6 +259,7 @@ describe("resolveMaxTokens", () => {
   const baseCfg: VisionHandoffConfig = {
     enabled: true,
     visionModel: "p/id",
+    fallbackModels: [],
     autoHandoff: true,
     handoffModels: [],
     prewarmPastedImages: false,
