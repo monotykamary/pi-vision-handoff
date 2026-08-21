@@ -22,9 +22,9 @@
  * errors.log.1) bounds growth to ~2× the cap.
  */
 
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { resolveAgentDir } from "./agent-dir.js";
 
 /** Subdirectory under the pi agent dir holding this extension's logs. */
 const LOG_SUBDIR = "logs/pi-vision-handoff";
@@ -76,7 +76,7 @@ export interface VisionErrorLogEntry {
 /** Directory holding this extension's logs:
  *  ~/.pi/agent/logs/pi-vision-handoff (overridable via $PI_CODING_AGENT_DIR). */
 export function getErrorLogDir(): string {
-  return join(getAgentDir(), LOG_SUBDIR);
+  return join(resolveAgentDir(), LOG_SUBDIR);
 }
 
 /** Path to the active error log file. */

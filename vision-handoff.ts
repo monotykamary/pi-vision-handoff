@@ -44,6 +44,7 @@ import {
   stripNonVisionImageNote,
   writeConfig,
   HANDOFF_COMMAND_DESCRIPTION,
+  UNAVAILABLE,
   type ExtractedImage,
   type VisionHandoffConfig,
 } from "./src/index.js";
@@ -52,12 +53,10 @@ import {
   USAGE_EVENT_CHANNEL,
   type VisionHandoffUsageRecord,
 } from "./src/usage.js";
-import { DescriptionLoader, UNAVAILABLE, type LoaderDeps } from "./src/dataloader.js";
+import type { DescriptionLoader, LoaderDeps } from "./src/dataloader.js";
 import { imageHash, findPastedImagePaths, readImageBuffer, readImageBufferBounded, resolvePrewarmImage, isOmittedImageNote } from "./src/image.js";
 import { appendVisionError } from "./src/error-log.js";
-import { resizeImage } from "@earendil-works/pi-coding-agent";
-import { VisionModelSelectorComponent, type VisionModelSelectorResult } from "./src/vision-model-selector.js";
-import { PrewarmEditor } from "./src/prewarm-editor.js";
+import type { VisionModelSelectorResult } from "./src/vision-model-selector.js";
 import { Text } from "@earendil-works/pi-tui";
 
 let config: VisionHandoffConfig = readConfig();
@@ -224,7 +223,19 @@ const loaderDeps: LoaderDeps = {
     lastDescriberError = msg;
   },
 };
-const loader = new DescriptionLoader(loaderDeps);
+// The describer chain (dataloader -> describer -> pi-ai/compat) and pi-core's
+// resizeImage / pi-tui's Text each drag a host module graph into this
+// extension's loader when imported statically. Load them behind the first
+// image turn / editor install / async render so startup stays import-free.
+let loaderPromise: Promise<DescriptionLoader> | undefined;
+const getLoader = (): Promise<DescriptionLoader> => {
+  loaderPromise ??= import("./src/dataloader.js").then(
+    ({ DescriptionLoader }) => new DescriptionLoader(loaderDeps),
+  );
+  return loaderPromise;
+};
+const loadResizeImage = () =>
+  import("@earendil-works/pi-coding-agent").then(({ resizeImage }) => resizeImage);
 
 function isConfigured(cfg: VisionHandoffConfig): boolean {
   return cfg.enabled && !!cfg.visionModel;
@@ -257,9 +268,11 @@ function shouldPrewarmPaste(): boolean {
  *  the description is generated without question context (the documented
  *  tradeoff of the opt-in). If the user submits before this dispatch fires,
  *  before_agent_start overwrites the prompt — a benign bonus, not a bug. */
-function prewarmClipboardPath(path: string, modelRegistry: ModelRegistry): void {
+async function prewarmClipboardPath(path: string, modelRegistry: ModelRegistry): Promise<void> {
   const read = readImageBuffer(path);
   if (!read) return;
+  const resizeImage = await loadResizeImage();
+  const loader = await getLoader();
   resolvePrewarmImage(read.buf, read.mimeType, resizeImage)
     .then((img) => {
       if (!img) return;
@@ -283,7 +296,7 @@ function prewarmClipboardPath(path: string, modelRegistry: ModelRegistry): void 
  *  (pi wires paste-image to the outermost editor only). When a custom editor
  *  is present, paste-time prewarm is unavailable; submit-time prewarm
  *  (before_agent_start) still covers clipboard paths. */
-function installPrewarmEditor(ctx: ExtensionContext): void {
+async function installPrewarmEditor(ctx: ExtensionContext): Promise<void> {
   if (ctx.mode !== "tui") {
     editorInstalled = false;
     return;
@@ -292,6 +305,7 @@ function installPrewarmEditor(ctx: ExtensionContext): void {
     editorInstalled = false;
     return;
   }
+  const { PrewarmEditor } = await import("./src/prewarm-editor.js");
   editorInstalled = true;
   ctx.ui.setEditorComponent((_tui, theme, keybindings) =>
     new PrewarmEditor(_tui, theme, keybindings, {
@@ -398,9 +412,9 @@ export default function (pi: ExtensionAPI) {
     visionModelCache = null;
     visionModelUnresolvedRef = null;
     warnedHashes.clear();
-    loader.reset();
+    void getLoader().then((loader) => loader.reset());
     currentModel = ctx.model;
-    installPrewarmEditor(ctx);
+    await installPrewarmEditor(ctx);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -418,6 +432,7 @@ export default function (pi: ExtensionAPI) {
     // signal into it. Without this reset, a previous turn's ESC would leave
     // the controller aborted and every dispatch would short-circuit to
     // UNAVAILABLE.
+    const loader = await getLoader();
     loader.resetTurnAbort();
 
     // Capture this turn's user prompt so every image in the turn — attached or
@@ -470,6 +485,7 @@ export default function (pi: ExtensionAPI) {
     // a supported image, or fails to resize is skipped (the agent's `read`
     // will still describe it via `tool_result` if it emits an image block).
     const clipboardPaths = findPastedImagePaths(event.prompt || "");
+    const resizeImage = await loadResizeImage();
     const preparedClipboardImages = clipboardPaths.map(
       async (path): Promise<PreparedClipboardImage | null> => {
         try {
@@ -584,6 +600,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (imgs.length === 0) return;
+    const loader = await getLoader();
     loader.bindTurnContext(ctx);
     if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
       notifyUnresolvedVisionModel(ctx, config.visionModel!);
@@ -676,6 +693,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (!anyImage) return;
     if (!isHandoffTarget(ctx.model, config)) return;
+    const loader = await getLoader();
     loader.bindTurnContext(ctx);
     if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
       notifyUnresolvedVisionModel(ctx, config.visionModel!);
@@ -1046,6 +1064,7 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
     return;
   }
 
+  const { VisionModelSelectorComponent } = await import("./src/vision-model-selector.js");
   const result = await ctx.ui.custom<VisionModelSelectorResult>((tui, theme, _kb, done) => {
     const selector = new VisionModelSelectorComponent(
       theme,

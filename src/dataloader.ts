@@ -31,8 +31,7 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
-  IMAGE_PLACEHOLDER_PREFIX,
-  IMAGE_PLACEHOLDER_SUFFIX,
+  UNAVAILABLE,
   wrapDescription,
   type ExtractedImage,
   type VisionHandoffConfig,
@@ -40,9 +39,9 @@ import {
 import { imageHash } from "./image.js";
 import { runBatch, describeSingle, type DescriberDeps } from "./describer.js";
 
-/** Resolved when a description couldn't be obtained (graceful degradation).
- *  Failures are NOT cached, so the next turn re-attempts. */
-export const UNAVAILABLE = `${IMAGE_PLACEHOLDER_PREFIX}description unavailable${IMAGE_PLACEHOLDER_SUFFIX}`;
+// Kept for back-compat with tests and older consumers; the canonical export
+// lives in ./index.js where it costs no describer-chain import.
+export { UNAVAILABLE };
 
 interface DescriptionBatch {
   keys: string[];

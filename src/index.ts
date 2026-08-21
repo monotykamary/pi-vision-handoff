@@ -6,9 +6,9 @@
  */
 
 import type { ImageContent, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveAgentDir } from "./agent-dir.js";
 
 export * from "./usage.js";
 
@@ -20,7 +20,7 @@ export const CONFIG_FILENAME = "pi-vision-handoff.json";
 
 /** Full config path: ~/.pi/agent/extensions/pi-vision-handoff.json */
 export function getConfigPath(): string {
-  return join(getAgentDir(), CONFIG_SUBDIR, CONFIG_FILENAME);
+  return join(resolveAgentDir(), CONFIG_SUBDIR, CONFIG_FILENAME);
 }
 
 /** Description shown in the / commands list. */
@@ -37,6 +37,11 @@ export const DEFAULT_USER_PROMPT_PREFIX = "The user's request about this image: 
 /** Placeholder text block injected in place of an image block. */
 export const IMAGE_PLACEHOLDER_PREFIX = "[Image: ";
 export const IMAGE_PLACEHOLDER_SUFFIX = "]";
+
+/** Resolved when a description couldn't be obtained (graceful degradation).
+ *  Failures are NOT cached, so the next turn re-attempts. Defined here so
+ *  consumers reach it without loading the describer chain. */
+export const UNAVAILABLE = `${IMAGE_PLACEHOLDER_PREFIX}description unavailable${IMAGE_PLACEHOLDER_SUFFIX}`;
 
 /** Marker appended to a description whose `completeSimple()` call ended with
  *  `stopReason: "length"` — i.e. the vision model hit a token limit (either the
@@ -299,7 +304,7 @@ export function readConfig(): VisionHandoffConfig {
 /** Write config to disk. Creates the directory if needed. Returns the path written. */
 export function writeConfig(config: VisionHandoffConfig): string {
   const path = getConfigPath();
-  const dir = join(getAgentDir(), CONFIG_SUBDIR);
+  const dir = join(resolveAgentDir(), CONFIG_SUBDIR);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
