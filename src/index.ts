@@ -185,6 +185,15 @@ export interface VisionHandoffConfig {
   prompt?: string;
   /** Override the user-prompt prefix (defaults to DEFAULT_USER_PROMPT_PREFIX). */
   userPromptPrefix?: string;
+  /** Opt-in: when true, generated descriptions are PERSISTED to the session
+   *  file as `[Image described: <hash>]` marker + description text blocks in
+   *  the read tool-result content (the image blob stays for kitty rendering).
+   *  On session resume — when the in-memory cache is empty (new process) — the
+   *  `context` hook matches the marker to the blob by hash and reuses the
+   *  persisted description WITHOUT calling the vision model, eliminating the
+   *  30-40s re-describe latency on every resumed "ciao". Off by default:
+   *  descriptions are generated per-session as before. */
+  persistDescriptions: boolean;
   /** Whether the vision describer should reason (think) before describing.
    *  Off by default — describing images is a perception task, not a reasoning
    *  one, and thinking adds latency + cost. When on, the level below is sent
@@ -212,6 +221,7 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   handoffModels: [],
   prewarmPastedImages: false,
   asyncClipboardHandoff: false,
+  persistDescriptions: false,
   maxTokens: undefined,
   cacheMax: DEFAULT_CACHE_MAX,
   maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
@@ -272,6 +282,7 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
   if (typeof obj.asyncClipboardHandoff === "boolean") {
     base.asyncClipboardHandoff = obj.asyncClipboardHandoff;
   }
+  if (typeof obj.persistDescriptions === "boolean") base.persistDescriptions = obj.persistDescriptions;
   // maxTokens: optional. undefined (default) = no artificial cap. Only set when
   // a valid positive finite number is given; any other value leaves it unset.
   if (typeof obj.maxTokens === "number" && Number.isFinite(obj.maxTokens) && obj.maxTokens > 0) {
@@ -491,6 +502,50 @@ export function parseBatchedDescriptions(text: string, count: number): (string |
     if (idx >= 0 && idx < count && !out[idx]) out[idx] = body || null;
   }
   return out;
+}
+
+/** Marker prefix/suffix framing a PERSISTED image description in the session
+ *  file. When {@link VisionHandoffConfig.persistDescriptions} is on, the read
+ *  tool `tool_result` handler appends a text block of the form
+ *  `[Image described: <hash>]\n<description>` right after the image block (the
+ *  blob stays for kitty inline rendering). On resume the `context` hook matches
+ *  the marker to the blob by hash and reuses the description — no vision call
+ *  for already-described images. */
+export const IMAGE_DESCRIBED_PREFIX = "[Image described: ";
+export const IMAGE_DESCRIBED_SUFFIX = "]";
+
+/** Regex matching a persisted-description text block: the marker (any 32-hex
+ *  hash — `imageHash()`'s sha256 slice) followed by the description body, which
+ *  may span multiple lines (the `[Image: …]` envelope is kept verbatim). */
+const PERSISTED_DESCRIPTION_RE = /\[Image described: ([0-9a-f]{32})\]\r?\n?([\s\S]*)/;
+
+/** Build the persisted-description text block for `hash`: the marker line, then
+ *  the (already wrapped/truncated) description on the following line(s). */
+export function buildPersistedDescriptionBlock(hash: string, description: string): string {
+  return `${IMAGE_DESCRIBED_PREFIX}${hash}${IMAGE_DESCRIBED_SUFFIX}\n${description}`;
+}
+
+/** Parse a persisted-description text block, returning the marker's image hash
+ *  and the description body. Returns null when the text carries no
+ *  `[Image described: <hash>]` marker or the body is empty. Callers decide what
+ *  counts as a usable description (e.g. filter out the UNAVAILABLE placeholder
+ *  so a persisted failure still falls back to a fresh vision call). */
+export function parsePersistedDescriptionBlock(
+  text: string,
+): { hash: string; description: string } | null {
+  const m = PERSISTED_DESCRIPTION_RE.exec(text);
+  if (!m) return null;
+  const description = m[2];
+  if (!description) return null;
+  return { hash: m[1], description };
+}
+
+/** Remove a `[Image described: <hash>]` marker line from a text block, leaving
+ *  just the description. Used by the `context` hook on the LLM-bound clone so
+ *  the model never sees the marker itself (the stored session block keeps it).
+ *  Returns the text unchanged when no marker is present. */
+export function stripPersistedMarker(text: string): string {
+  return text.replace(/\[Image described: [0-9a-f]{32}\]\r?\n?/, "");
 }
 
 /** Truncate (if configured) and wrap a raw description in the `[Image: …]`

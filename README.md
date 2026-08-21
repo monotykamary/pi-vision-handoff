@@ -46,6 +46,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 - **🚀 Paste-time prewarm (opt-in)** — `prewarmPastedImages` (off by default) wraps the editor so pasted clipboard images are described the *instant* their path lands in the prompt — before you hit enter — not at submit. The vision call starts concurrent with you typing your question. Tradeoff: the description is generated without your typed question as context (the question usually isn't entered yet at paste time), and a paste-then-abandon wastes one vision call. TUI only; inactive if another extension replaces the editor. Toggle with `/vision-handoff prewarm on`.
 - **🏁 Async pasted-path fallback (opt-in)** — `asyncClipboardHandoff` races the normal read path against asynchronous delivery. A direct `read` or nested Fabric `pi.read` of the pasted path cancels the fallback and uses the normal tool-result/context flow; otherwise the completed description is queued as a steering message. Its transcript row is collapsed to one line by default and expands with `Ctrl+O`. Toggle it in the picker with `Ctrl+A` or run `/vision-handoff fallback on`.
 - **🧠 Aware prompt (opt-in)** — `awarePrompt` (off by default) injects a system-prompt note on handoff targets telling the text-only model it CAN read images via the read tool (the handoff swaps image blocks for descriptions). Some models otherwise refuse image-reading requests from self-knowledge even though the description is delivered as text. Toggle with `/vision-handoff aware on`.
+- **💾 Session persistence (opt-in)** — `persistDescriptions` writes each generated description into the session file as a `[Image described: <hash>]` marker + text block next to the read-result blob (the blob stays for kitty rendering). On `/resume` — a new process with an empty in-memory cache — the `context` hook matches the marker to the blob by hash and reuses the persisted description, so a resumed session **never re-calls the vision model** for already-described images (no 30-40s re-describe on the first resumed "ciao"). The persisted description is also seeded into the session cache, so later re-reads of the same image hit too. Toggle with `/vision-handoff persist on`.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
 - **📋 Error logging** — every describer failure and every `image description failed` warning is appended as a JSONL line to `~/.pi/agent/logs/pi-vision-handoff/errors.log`, so a warning like `image description failed — unknown error` is troubleshootable: the detailed reason (exception stack, `stopReason`, config snapshot) is captured at the describer's failure source even when the in-memory error string was already reset by the time the warning fired. Size-capped with a single `.1` backup.
 - **📊 Usage reporting** — every real describer call reports model + tokens (and Neuralwatt energy/cost when the vision model is a Neuralwatt model), via `pi.appendEntry` + a `vision-handoff:usage` event for live consumers.
@@ -66,6 +67,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 | `/vision-handoff prewarm on` / `off` | Toggle paste-time prewarm (opt-in, off by default) |
 | `/vision-handoff fallback on` / `off` | Race matching reads against async pasted-path description injection (opt-in) |
 | `/vision-handoff aware on` / `off` | Tell handoff targets they can read images via the read tool (opt-in, off by default) |
+| `/vision-handoff persist on` / `off` | Persist descriptions to the session file; resumed sessions reuse them with no new vision call (opt-in) |
 | `/vision-handoff add ollama/llava:13b` | Force handoff for an extra model |
 | `/vision-handoff remove ollama/llava:13b` | Stop forcing handoff for a model |
 | `/vision-handoff clear` | Clear the configured vision model |
@@ -84,6 +86,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
   "prewarmPastedImages": false,
   "asyncClipboardHandoff": false,
   "awarePrompt": false,
+  "persistDescriptions": false,
   "maxTokens": null,
   "cacheMax": 50,
   "maxDescriptionLines": 0,
@@ -101,6 +104,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `prewarmPastedImages` | `false` | **Opt-in paste-time prewarm.** When `true`, a custom editor wrapper describes pasted clipboard images the instant their temp-file path lands in the prompt (pre-submit), instead of at submit. Trades a bit of description quality (the description is generated without your typed question as context, since the question usually isn't entered yet at paste time) and a speculative vision call on paste-then-abandon, for earlier prewarm. TUI mode only; inactive if another extension has replaced the editor. |
 | `asyncClipboardHandoff` | `false` | **Opt-in async fallback.** Starts from the existing submit-time prewarm. A matching direct `read` or Fabric-nested `pi.read` cancels message delivery; if no matching read wins, the description is queued asynchronously as a collapsed custom message and triggers/continues the agent turn. |
 | `awarePrompt` | `false` | **Opt-in aware prompt.** When `true`, injects a system-prompt note on handoff targets telling the text-only model it CAN read images via the read tool (the handoff swaps image blocks for descriptions). Some models otherwise refuse image-reading requests from self-knowledge. |
+| `persistDescriptions` | `false` | **Opt-in session persistence.** When `true`, every generated description is written into the session file as a `[Image described: <hash>]` marker + description text block in the read tool-result content, next to the blob (which stays for kitty rendering). On `/resume`, the `context` hook matches the marker to the blob by hash and reuses the persisted description — no vision call, no wait. Only real descriptions are persisted (a failed `[Image: description unavailable]` is not replayed; the next turn re-attempts). |
 | `maxTokens` | _(unset = model max, clamped to context window)_ | Cap on a single description's output. `null`/unset = use the vision model's declared max output (`model.maxTokens`), clamped so `maxTokens + 8192 <= contextWindow` (a model whose declared max equals its full context window would otherwise be rejected with a 400). Set a number only to cap cost/latency. A truncation is always surfaced via a `[... description truncated …]` marker when the model hits the limit, so a cut-off description is never mistaken for complete. |
 | `cacheMax` | `50` | Max described images kept in the in-memory cache per session. |
 | `maxDescriptionLines` | `0` | Cap on description lines (`0` = unbounded). Default keeps the full description so the `read` tool's native collapse (`ctrl+o`) handles compactness and the model gets complete context; setting `> 0` applies a lossy head-cap to both the TUI render and the model. |
@@ -218,9 +222,13 @@ The default submit-time pipeline below runs regardless:
           phase (free time: the agent is just waiting for tool results), so
           the batch is COMPLETE before `context` fires → `context` is a
           non-blocking cache hit, not a cold miss on the critical path
-        • does NOT mutate the result: the image stays in storage for kitty
-          inline rendering and `/resume`; the image→text swap happens in the
-          `context` hook (on the cloned LLM-bound payload only)
+        • does NOT mutate the result by default: the image stays in storage for
+          kitty inline rendering and `/resume`; the image→text swap happens in
+          the `context` hook (on the cloned LLM-bound payload only). With the
+          opt-in `persistDescriptions`, it additionally appends a
+          `[Image described: <hash>]` marker + description text block after
+          each image block, so the description survives in the session file
+          for `/resume` (the blob still stays for kitty rendering)
     → context   (FALLBACK + swap — fires before each LLM call)
         • catches image blocks that didn't go through `read`'s tool_result —
           user-attached images, custom extension-injected messages — and
@@ -229,6 +237,12 @@ The default submit-time pipeline below runs regardless:
           loader's current batch; swaps images for text in the cloned LLM-bound
           payload (`emitContext` does a `structuredClone`), leaving storage
           intact for kitty inline rendering and `/resume`
+        • persistence fast-path (opt-in): on `/resume` — new process, empty
+          in-memory cache — images whose session content carries a
+          `[Image described: <hash>]` marker matching their hash are NOT sent
+          to the vision model at all: the persisted description is reused
+          verbatim (blob dropped from the clone, marker stripped) and seeded
+          into the session cache for later re-reads
 
 Because the describer runs during the **tool-result phase** (before the agent's next turn), not during the `context` transform (the critical path right before the LLM call), the agent gets described text immediately when its turn starts — it never waits on the describer inline.
 
@@ -254,7 +268,7 @@ Because pi runs parallel `read` tool calls via `Promise.all` and fires each read
 
 | Hook | Image block shape | Handling |
 |------|-------------------|----------|
-| `context` (all messages) | `{ type: "image", data, mimeType }` (pi-ai internal) | undescribed → replaced with description text; already-described → dropped |
+| `context` (all messages) | `{ type: "image", data, mimeType }` (pi-ai internal) | undescribed → replaced with description text; already-described (persisted `[Image described: <hash>]` marker present) → image dropped, marker stripped, persisted description reused — **no vision call on resume** |
 | `context` (all messages) | `{ type: "image_url", image_url: { url: "data:…" } }` (OpenAI Chat Completions) | detected by shape → replaced with `{ type: "text", text }` |
 | `context` (all messages) | `{ type: "input_image", image_url: "data:…" }` (OpenAI Responses) | detected by shape → replaced with `{ type: "input_text", text }` |
 | `context` (all messages) | `{ type: "image", source: { type: "base64", media_type, data } }` (Anthropic Messages) | detected by shape → replaced with `{ type: "text", text }` |
