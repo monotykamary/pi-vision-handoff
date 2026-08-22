@@ -1038,8 +1038,15 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
     .getAll()
     .map((m) => ({ provider: m.provider, id: m.id, name: m.name, input: m.input, reasoning: m.reasoning }));
 
+  // Vision-capable models only (plus the current selection, whatever it is) —
+  // mirrors the TUI selector's vision-only list.
+  const eligibleModels = allModels.filter(
+    (m) =>
+      isVisionModel(m) ||
+      (config.visionModel !== null && `${m.provider}/${m.id}` === config.visionModel),
+  );
   if (ctx.mode !== "tui") {
-    const modelItems = ["None", ...allModels.map((m) => `${m.provider}/${m.id}`)];
+    const modelItems = ["None", ...eligibleModels.map((m) => `${m.provider}/${m.id}`)];
     const modelPick = await ctx.ui.select("Vision model", modelItems);
     if (modelPick === undefined) return;
     const ref = modelPick === "None" ? null : modelPick;

@@ -269,10 +269,18 @@ export class VisionModelSelectorComponent implements Component {
       reasoning: !!m.reasoning,
     });
 
-    // Vision-capable first (registry order), then the rest (registry order).
-    const visionModels = allModels.filter((m) => isVisionModel(m)).map(make);
-    const textModels = allModels.filter((m) => !isVisionModel(m)).map(make);
-    return [...items, ...visionModels, ...textModels];
+    // Vision-capable models only (registry order), plus the currently
+    // configured model even if it doesn't declare image input — so an existing
+    // non-vision selection still shows and can be changed or kept. Text-only
+    // models are hidden: they make poor describers and bury the useful rows.
+    const visionModels = allModels
+      .filter(
+        (m) =>
+          isVisionModel(m) ||
+          (this.currentRef !== null && formatModelRef(m.provider, m.id) === this.currentRef),
+      )
+      .map(make);
+    return [...items, ...visionModels];
   }
 
   private getFooterText(): string {
