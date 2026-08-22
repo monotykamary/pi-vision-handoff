@@ -39,6 +39,7 @@ function makeLoader(
     maxDescriptionLines: 0,
     thinking: false,
     thinkingLevel: "medium",
+    agentHint: true,
     ...cfgOverrides,
   };
   const deps: LoaderDeps = {

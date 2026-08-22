@@ -61,6 +61,22 @@ import { Text } from "@earendil-works/pi-tui";
 
 let config: VisionHandoffConfig = readConfig();
 
+/** Marker embedded in every agent hint so re-application stays idempotent
+ *  even when another extension chains onto ours. */
+export const AGENT_HINT_MARKER = "## Image perception (vision handoff)";
+
+/** System-prompt note appended on handoff-target turns when `agentHint` is on.
+ *  Without it, text-only models almost never discover that pasted images
+ *  arrive as text descriptions, or that reading an image file yields a
+ *  description — so the handoff silently does nothing for them. Kept short:
+ *  it rides every turn's system prompt for non-vision models. */
+const AGENT_HINT = `\n\n${AGENT_HINT_MARKER}
+
+This session's chat model cannot see image blocks directly. Images are made perceivable through text descriptions:
+
+- Image attachments/pastes arrive already converted to a text description — treat that description AS the image contents; nothing visual exists beyond it.
+- Any image file (jpg/png/gif/webp/bmp) can be inspected on demand: call the read tool on its file path and you will receive a text description of what it shows instead of raw pixels. Do this whenever a task involves looking at a screenshot, photo, diagram, chart, or rendered output — do NOT say you cannot view images.`;
+
 /** Most recent describer failure message (auth error, network error, abort,
  *  empty response, etc.). Set by the describer via the loader deps; surfaced
  *  to the user by the `context`/`tool_result` handler via ctx.ui.notify so a
@@ -422,6 +438,17 @@ export default function (pi: ExtensionAPI) {
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
 
+    // Capability hint (config.agentHint, default on): tell the agent HOW it
+    // perceives images. Returned at the end of the handler so early-exit
+    // paths (e.g. an unresolvable vision model -> no descriptions will ever
+    // arrive) don't advertise a capability that isn't active this turn.
+    const hintedSystemPrompt =
+      config.agentHint &&
+      typeof event.systemPrompt === "string" &&
+      !event.systemPrompt.includes(AGENT_HINT_MARKER)
+        ? event.systemPrompt + AGENT_HINT
+        : event.systemPrompt;
+
     // Fresh turn → fresh turn-abort controller. `before_agent_start` fires
     // BEFORE the agent run starts, so `ctx.signal` is undefined here (the run's
     // abort signal doesn't exist yet — it's created in `agent.prompt()` →
@@ -510,6 +537,8 @@ export default function (pi: ExtensionAPI) {
       // original fire-and-forget submit-time prewarm behavior.
       for (const prepared of preparedClipboardImages) prepared.catch(() => {});
     }
+
+    return { systemPrompt: hintedSystemPrompt };
   });
 
   // A direct read and a nested pi.read both emit a read tool_call. If it targets

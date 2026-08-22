@@ -195,6 +195,11 @@ export interface VisionHandoffConfig {
    *  {@link THINKING_LEVELS}. Ignored when {@link thinking} is off or the
    *  vision model lacks reasoning support. */
   thinkingLevel: ThinkingLevel;
+  /** When true (default), append a short capability note to the system prompt
+   *  on handoff-target turns so the agent knows images arrive as descriptions
+   *  and that it can inspect any image file by reading it. Without this,
+   *  text-only models rarely discover the `read`-an-image path on their own. */
+  agentHint: boolean;
 }
 
 export const DEFAULT_CONFIG: VisionHandoffConfig = {
@@ -210,6 +215,7 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
   thinking: false,
   thinkingLevel: DEFAULT_THINKING_LEVEL,
+  agentHint: true,
 };
 
 /** Parse a "provider/id" reference. Returns null if malformed. */
@@ -285,6 +291,7 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
 
   if (typeof obj.thinking === "boolean") base.thinking = obj.thinking;
   if (isThinkingLevel(obj.thinkingLevel)) base.thinkingLevel = obj.thinkingLevel;
+  if (typeof obj.agentHint === "boolean") base.agentHint = obj.agentHint;
 
   return base;
 }
