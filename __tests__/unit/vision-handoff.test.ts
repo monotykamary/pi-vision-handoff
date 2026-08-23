@@ -159,6 +159,15 @@ describe("normalizeConfig", () => {
     expect(normalizeConfig({ asyncClipboardHandoff: "yes" }).asyncClipboardHandoff).toBe(false);
   });
 
+  it("awarePrompt defaults to false (opt-in) and accepts only booleans", () => {
+    expect(DEFAULT_CONFIG.awarePrompt).toBe(false);
+    expect(normalizeConfig({}).awarePrompt).toBe(false);
+    expect(normalizeConfig({ awarePrompt: true }).awarePrompt).toBe(true);
+    expect(normalizeConfig({ awarePrompt: false }).awarePrompt).toBe(false);
+    expect(normalizeConfig({ awarePrompt: "yes" }).awarePrompt).toBe(false);
+    expect(normalizeConfig({ awarePrompt: null }).awarePrompt).toBe(false);
+  });
+
   it("thinking accepts a boolean on/off and a valid level", () => {
     const cfg = normalizeConfig({ thinking: true, thinkingLevel: "high" });
     expect(cfg.thinking).toBe(true);

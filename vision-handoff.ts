@@ -61,6 +61,16 @@ import { Text } from "@earendil-works/pi-tui";
 
 let config: VisionHandoffConfig = readConfig();
 
+/** Marker used to dedup the aware-prompt system-prompt note across turns. */
+const AWARE_PROMPT_MARKER = "# Image reading (pi-vision-handoff active)";
+
+/** System-prompt note injected on handoff targets when `awarePrompt` is on.
+ *  Tells the text-only model it CAN read images via the read tool, since the
+ *  handoff swaps image blocks for descriptions. */
+const AWARE_PROMPT_NOTE = `# Image reading (pi-vision-handoff active)
+
+This model lacks native image input, but the pi-vision-handoff extension is enabled: when you call the read tool on an image file, a configured vision model ({visionModel}) describes it and the description is injected as text in the tool result. You CAN read and act on images via the read tool — do not refuse image-reading requests or claim you cannot see images. The "[Current model does not support images…]" note in tool output is stale and is stripped by the extension.`;
+
 /** Most recent describer failure message (auth error, network error, abort,
  *  empty response, etc.). Set by the describer via the loader deps; surfaced
  *  to the user by the `context`/`tool_result` handler via ctx.ui.notify so a
@@ -512,6 +522,25 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // Opt-in: tell text-only handoff targets they CAN read images via the
+  // read tool, since the handoff swaps image blocks for descriptions. Some
+  // models otherwise refuse image-reading requests from self-knowledge even
+  // though the description is delivered as text. Separate handler so it never
+  // interferes with the prewarm logic below.
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (!isConfigured(config)) return;
+    if (!config.awarePrompt) return;
+    if (!isHandoffTarget(ctx.model, config)) return;
+    if (!config.visionModel) return;
+    if (event.systemPrompt.includes(AWARE_PROMPT_MARKER)) return;
+    return {
+      systemPrompt:
+        event.systemPrompt +
+        "\n\n" +
+        AWARE_PROMPT_NOTE.replace("{visionModel}", config.visionModel),
+    };
+  });
+
   // A direct read and a nested pi.read both emit a read tool_call. If it targets
   // one of this turn's pasted clipboard paths before the async fallback is
   // injected, the normal tool_result/context path wins and the queued custom
@@ -753,7 +782,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("vision-handoff", {
     description: HANDOFF_COMMAND_DESCRIPTION,
     getArgumentCompletions(prefix: string) {
-      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "prewarm", "fallback", "add", "remove", "clear", "help"];
+      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "prewarm", "fallback", "aware", "add", "remove", "clear", "help"];
       const matches = subcommands.filter((s) => s.startsWith(prefix));
       return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
     },
@@ -791,6 +820,8 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "                               Toggle describing pasted images at paste-time (opt-in, off by default)",
         "  /vision-handoff fallback <on|off>",
         "                               Inject pasted-image descriptions asynchronously when no matching read wins",
+        "  /vision-handoff aware <on|off>",
+        "                               Tell handoff targets they can read images via the read tool (opt-in, off by default)",
         "  /vision-handoff add <p/id>     Force handoff for an extra model",
         "  /vision-handoff remove <p/id>  Stop forcing handoff for a model",
         "  /vision-handoff clear          Clear the configured vision model",
@@ -850,6 +881,11 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
 
   if (subcommand === "fallback") {
     handleFallbackSubcommand(ctx, rest);
+    return;
+  }
+
+  if (subcommand === "aware") {
+    handleAwareSubcommand(ctx, rest);
     return;
   }
 
@@ -1028,6 +1064,31 @@ function handleFallbackSubcommand(ctx: ExtensionCommandContext, rest: string): v
   );
 }
 
+/** Handle /vision-handoff aware <on|off>. */
+function handleAwareSubcommand(ctx: ExtensionCommandContext, rest: string): void {
+  const value = rest.trim().toLowerCase();
+  if (!value) {
+    ctx.ui.notify(
+      `Aware prompt: ${config.awarePrompt ? "on" : "off"}.\n` +
+        "Usage: /vision-handoff aware <on|off>",
+      "info",
+    );
+    return;
+  }
+  if (value !== "on" && value !== "off") {
+    ctx.ui.notify("Usage: /vision-handoff aware <on|off>", "warning");
+    return;
+  }
+  const on = value === "on";
+  updateConfig(
+    ctx,
+    (c) => ({ ...c, awarePrompt: on }),
+    on
+      ? "Aware prompt on — handoff targets are told they can read images via the read tool."
+      : "Aware prompt off.",
+  );
+}
+
 async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify("/vision-handoff requires interactive mode.", "error");
@@ -1122,6 +1183,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
   lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
   lines.push(`Paste-time prewarm: ${config.prewarmPastedImages ? `on${editorInstalled ? "" : " (inactive — another custom editor is active)"}` : "off"}`);
   lines.push(`Async pasted-path fallback: ${config.asyncClipboardHandoff ? "on" : "off"}`);
+  lines.push(`Aware prompt: ${config.awarePrompt ? "on" : "off"}`);
   lines.push(`maxTokens: ${config.maxTokens ?? "unbounded"} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
 
   const model = ctx.model;
