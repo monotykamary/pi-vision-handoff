@@ -195,6 +195,13 @@ export interface VisionHandoffConfig {
    *  {@link THINKING_LEVELS}. Ignored when {@link thinking} is off or the
    *  vision model lacks reasoning support. */
   thinkingLevel: ThinkingLevel;
+  /** Opt-in: inject a system-prompt note on handoff targets telling the
+   *  text-only model it CAN read images via the read tool (the handoff swaps
+   *  image blocks for descriptions). Off by default — without it, some
+   *  models refuse image-reading requests from their own self-knowledge even
+   *  though the description is delivered as text. Toggle with
+   *  `/vision-handoff aware on|off`. */
+  awarePrompt: boolean;
 }
 
 export const DEFAULT_CONFIG: VisionHandoffConfig = {
@@ -210,6 +217,7 @@ export const DEFAULT_CONFIG: VisionHandoffConfig = {
   maxDescriptionLines: DEFAULT_MAX_DESCRIPTION_LINES,
   thinking: false,
   thinkingLevel: DEFAULT_THINKING_LEVEL,
+  awarePrompt: false,
 };
 
 /** Parse a "provider/id" reference. Returns null if malformed. */
@@ -285,6 +293,7 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
 
   if (typeof obj.thinking === "boolean") base.thinking = obj.thinking;
   if (isThinkingLevel(obj.thinkingLevel)) base.thinkingLevel = obj.thinkingLevel;
+  if (typeof obj.awarePrompt === "boolean") base.awarePrompt = obj.awarePrompt;
 
   return base;
 }

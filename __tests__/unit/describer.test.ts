@@ -80,6 +80,7 @@ const cfg: VisionHandoffConfig = {
   maxDescriptionLines: 0,
   thinking: false,
   thinkingLevel: "medium",
+  awarePrompt: false,
 };
 
 const modelRegistry = {
@@ -310,6 +311,7 @@ describe("resolveMaxTokens", () => {
     maxDescriptionLines: 0,
     thinking: false,
     thinkingLevel: "medium",
+    awarePrompt: false,
   };
   const model = (maxTokens: number, contextWindow: number) =>
     ({ provider: "p", id: "id", maxTokens, contextWindow }) as any;

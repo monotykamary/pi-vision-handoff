@@ -14,7 +14,9 @@ const {
   findPastedImagePathsMock,
   readImageBufferMock,
   resolvePrewarmImageMock,
+  configOverrides,
 } = vi.hoisted(() => ({
+  configOverrides: { current: {} as Record<string, unknown> },
   readImageBufferBoundedMock: vi.fn((): { buf: Buffer; mimeType: string } | null => ({
     buf: Buffer.from("RECOVERED"),
     mimeType: "image/png",
@@ -44,6 +46,7 @@ vi.mock("../../src/index.js", async (importActual) => {
       handoffModels: [],
       prewarmPastedImages: false,
       asyncClipboardHandoff: true,
+      ...configOverrides.current,
     }),
   };
 });
@@ -350,6 +353,51 @@ describe("async pasted-path fallback race", () => {
     // leave it running for the read result to reuse; only message injection is
     // required to lose this race.
     expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("aware prompt coexists with the fallback: appends the note AND still injects the steering message", async () => {
+    configOverrides.current = { awarePrompt: true };
+    const { pi, handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+
+    const ret = (await handlers["before_agent_start"](
+      { type: "before_agent_start", prompt: "inspect clipboard-image", images: [], systemPrompt: "BASE PROMPT" },
+      sessionCtx(),
+    )) as { systemPrompt?: string } | undefined;
+
+    // The system prompt gains the aware note with the configured vision model...
+    expect(ret?.systemPrompt).toContain("BASE PROMPT");
+    expect(ret?.systemPrompt).toContain("# Image reading (pi-vision-handoff active)");
+    expect(ret?.systemPrompt).toContain("test/vision");
+
+    // ...and the async fallback still fires (single before_agent_start handler:
+    // a second registration would shadow the fallback bootstrap).
+    await handlers["tool_call"](
+      { type: "tool_call", toolName: "fabric_exec", input: { code: "return 1" } },
+      ctxWithSignal(),
+    );
+    await flushAsyncHandoff();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    // A second pass with the note already present does not append it again.
+    const ret2 = (await handlers["before_agent_start"](
+      { type: "before_agent_start", prompt: "again", images: [], systemPrompt: ret!.systemPrompt! },
+      sessionCtx(),
+    )) as { systemPrompt?: string } | undefined;
+    const prompt2 = (ret2?.systemPrompt ?? ret!.systemPrompt!) as string;
+    expect(prompt2.split("# Image reading (pi-vision-handoff active)").length - 1).toBe(1);
+
+    configOverrides.current = {};
+  });
+
+  it("aware prompt off (default): before_agent_start overrides nothing", async () => {
+    const { handlers } = setup();
+    await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
+    const ret = await handlers["before_agent_start"](
+      { type: "before_agent_start", prompt: "inspect clipboard-image", images: [], systemPrompt: "BASE PROMPT" },
+      sessionCtx(),
+    );
+    expect(ret).toBeUndefined();
   });
 
   it("does not cancel for a read of an unrelated path", async () => {
