@@ -25,6 +25,11 @@ import {
   wrapDescription,
   writeConfig,
   BATCH_IMAGE_MARKER_END,
+  buildPersistedDescriptionBlock,
+  parsePersistedDescriptionBlock,
+  stripPersistedMarker,
+  IMAGE_DESCRIBED_PREFIX,
+  IMAGE_DESCRIBED_SUFFIX,
   type VisionHandoffConfig,
 } from "../../src/index.js";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
@@ -166,6 +171,15 @@ describe("normalizeConfig", () => {
     expect(normalizeConfig({ awarePrompt: false }).awarePrompt).toBe(false);
     expect(normalizeConfig({ awarePrompt: "yes" }).awarePrompt).toBe(false);
     expect(normalizeConfig({ awarePrompt: null }).awarePrompt).toBe(false);
+  });
+
+  it("persistDescriptions defaults to false (opt-in) and accepts only booleans", () => {
+    expect(DEFAULT_CONFIG.persistDescriptions).toBe(false);
+    expect(normalizeConfig({}).persistDescriptions).toBe(false);
+    expect(normalizeConfig({ persistDescriptions: true }).persistDescriptions).toBe(true);
+    expect(normalizeConfig({ persistDescriptions: false }).persistDescriptions).toBe(false);
+    expect(normalizeConfig({ persistDescriptions: "yes" }).persistDescriptions).toBe(false);
+    expect(normalizeConfig({ persistDescriptions: 1 }).persistDescriptions).toBe(false);
   });
 
   it("thinking accepts a boolean on/off and a valid level", () => {
@@ -614,6 +628,67 @@ describe("wrapDescription", () => {
   it("leaves the description unbounded when maxDescriptionLines is 0 (default)", () => {
     const long = "line1\nline2\nline3\nline4";
     expect(wrapDescription(long, DEFAULT_CONFIG)).toBe(`[Image: ${long}]`);
+  });
+});
+
+describe("persisted description blocks ([Image described: <hash>] marker)", () => {
+  const HASH = "abcdef0123456789abcdef0123456789";
+
+  it("buildPersistedDescriptionBlock frames the marker line + description", () => {
+    expect(buildPersistedDescriptionBlock(HASH, "[Image: a vivid scene]")).toBe(
+      `[Image described: ${HASH}]\n[Image: a vivid scene]`,
+    );
+    expect(buildPersistedDescriptionBlock(HASH, "[Image: a vivid scene]")).toContain(IMAGE_DESCRIBED_PREFIX);
+    expect(buildPersistedDescriptionBlock(HASH, "[Image: a vivid scene]")).toContain(IMAGE_DESCRIBED_SUFFIX);
+  });
+
+  it("parsePersistedDescriptionBlock recovers hash + description, including multi-line bodies", () => {
+    const text = buildPersistedDescriptionBlock(HASH, "[Image: line1\nline2\nline3]");
+    expect(parsePersistedDescriptionBlock(text)).toEqual({
+      hash: HASH,
+      description: "[Image: line1\nline2\nline3]",
+    });
+  });
+
+  it("parsePersistedDescriptionBlock returns null for text without a marker", () => {
+    expect(parsePersistedDescriptionBlock("Read image file [image/png]")).toBeNull();
+    expect(parsePersistedDescriptionBlock("[Image: plain description]")).toBeNull();
+    expect(parsePersistedDescriptionBlock("")).toBeNull();
+  });
+
+  it("parsePersistedDescriptionBlock returns null for an empty description body", () => {
+    expect(parsePersistedDescriptionBlock(`[Image described: ${HASH}]`)).toBeNull();
+    expect(parsePersistedDescriptionBlock(`[Image described: ${HASH}]\n`)).toBeNull();
+  });
+
+  it("parsePersistedDescriptionBlock requires a 32-hex hash (no partial/fake markers)", () => {
+    expect(parsePersistedDescriptionBlock("[Image described: not-a-hash]\ndesc")).toBeNull();
+    expect(parsePersistedDescriptionBlock("[Image described: abc]\ndesc")).toBeNull();
+    expect(parsePersistedDescriptionBlock(`[Image described: ${HASH.toUpperCase()}]\ndesc`)).toBeNull();
+  });
+
+  it("stripPersistedMarker removes the marker line and leaves the description", () => {
+    const text = buildPersistedDescriptionBlock(HASH, "[Image: a vivid scene]");
+    expect(stripPersistedMarker(text)).toBe("[Image: a vivid scene]");
+  });
+
+  it("stripPersistedMarker strips any 32-hex marker, not just a known hash", () => {
+    expect(stripPersistedMarker("[Image described: 11112222333344445555666677778888]\n[Image: x]")).toBe(
+      "[Image: x]",
+    );
+  });
+
+  it("stripPersistedMarker returns text unchanged when no marker is present", () => {
+    expect(stripPersistedMarker("Read image file [image/png]")).toBe("Read image file [image/png]");
+    expect(stripPersistedMarker("")).toBe("");
+  });
+
+  it("round-trips through build → parse → strip for a wrapped (truncated) description", () => {
+    const wrapped = wrapDescription("a\nb\nc\nd", { ...DEFAULT_CONFIG, maxDescriptionLines: 2 });
+    const block = buildPersistedDescriptionBlock(HASH, wrapped);
+    const parsed = parsePersistedDescriptionBlock(block);
+    expect(parsed).toEqual({ hash: HASH, description: wrapped });
+    expect(stripPersistedMarker(block)).toBe(wrapped);
   });
 });
 

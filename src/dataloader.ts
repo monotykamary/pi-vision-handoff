@@ -242,6 +242,22 @@ export class DescriptionLoader implements Disposable {
     return promise;
   }
 
+  /** Seed the in-memory cache with a known description for a hash — used on
+   *  session resume, where the `context` hook recovers persisted descriptions
+   *  from the session file and wants later reads of the same image (same hash)
+   *  in this session to hit the cache instead of re-describing. Respects
+   *  `cacheMax` eviction like a resolved load. No-op when the hash is already
+   *  cached (fresh value wins). */
+  seedDescription(hash: string, description: string): void {
+    if (this.cache.has(hash)) return;
+    const cfg = this.deps.getConfig();
+    if (this.cache.size >= cfg.cacheMax) {
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey !== undefined) this.cache.delete(firstKey);
+    }
+    this.cache.set(hash, Promise.resolve(description));
+  }
+
   /** Abandon any in-flight batch and clear turn context. Used on session reset
    *  (the batch's turn is gone) — also exposed via `[Symbol.dispose]` so a
    *  `using` binding can scope a loader lifetime. The description cache is

@@ -34,6 +34,7 @@ function makeLoader(
     handoffModels: [],
     prewarmPastedImages: false,
     asyncClipboardHandoff: false,
+    persistDescriptions: false,
     maxTokens: undefined,
     cacheMax: 50,
     maxDescriptionLines: 0,
@@ -147,6 +148,44 @@ describe("DescriptionLoader batching", () => {
     const out = await loader.loadDescription(img("AAA"));
     expect(out).toBe(UNAVAILABLE);
     expect(runBatch).not.toHaveBeenCalled();
+  });
+
+  it("seedDescription pre-populates the cache: a later load is a hit (no vision call)", async () => {
+    const loader = makeLoader();
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    const a = img("AAA");
+    const hash = hashOf(a);
+
+    loader.seedDescription(hash, "[Image: from session file]");
+    const out = await loader.loadDescription(a);
+    expect(out).toBe("[Image: from session file]");
+    expect(runBatch).not.toHaveBeenCalled();
+  });
+
+  it("seedDescription respects cacheMax eviction like a resolved load", async () => {
+    const loader = makeLoader({}, { cacheMax: 1 });
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    loader.seedDescription(hashOf(img("AAA")), "[Image: a]");
+    loader.seedDescription(hashOf(img("BBB")), "[Image: b]"); // evicts AAA's seed
+
+    // BBB's seed survived the eviction of AAA.
+    expect(await loader.loadDescription(img("BBB"))).toBe("[Image: b]");
+    // AAA is gone from the cache → a fresh load batches (one vision call), and
+    // re-caching AAA in turn evicts BBB.
+    const out = await loader.loadDescription(img("AAA"));
+    expect(out).not.toBe("[Image: a]");
+    expect(runBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("seedDescription does not overwrite an existing (live) cache entry", async () => {
+    const loader = makeLoader();
+    loader.bindTurnContext({ modelRegistry: {} as any });
+    const a = img("AAA");
+    await loader.loadDescription(a); // resolved via runBatch → cached
+    const calls = runBatch.mock.calls.length;
+    loader.seedDescription(hashOf(a), "[Image: stale seed]");
+    expect(await loader.loadDescription(a)).toBe(`[Image: desc-for-${hashOf(a)}]`);
+    expect(runBatch.mock.calls.length).toBe(calls);
   });
 
   it("implements Disposable: [Symbol.dispose] resets in-flight batch + turn context", async () => {

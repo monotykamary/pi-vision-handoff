@@ -43,6 +43,9 @@ import {
   readConfig,
   stripNonVisionImageNote,
   writeConfig,
+  buildPersistedDescriptionBlock,
+  parsePersistedDescriptionBlock,
+  stripPersistedMarker,
   HANDOFF_COMMAND_DESCRIPTION,
   UNAVAILABLE,
   type ExtractedImage,
@@ -689,6 +692,37 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
+
+    // PERSISTENCE (opt-in, `persistDescriptions`): append a
+    // `[Image described: <hash>]` marker + description text block after each
+    // image block, so the session file carries the description next to the
+    // blob (which stays for kitty inline rendering). On `/resume` — new
+    // process, in-memory cache empty — the `context` hook matches the marker
+    // to the blob by hash and reuses the persisted description, skipping the
+    // vision call entirely (no 30-40s re-describe on every resumed turn).
+    // Only real descriptions are persisted (UNAVAILABLE is a transient
+    // failure, not a description worth replaying — next turn re-attempts).
+    // `imgs`/`descs` are aligned in content order, so walking `next` and
+    // consuming one desc per image block pairs them correctly.
+    if (config.persistDescriptions && hasImageBlock) {
+      const withPersisted: (TextContent | ImageContent)[] = [];
+      let imgIndex = 0;
+      for (const block of next) {
+        withPersisted.push(block);
+        const img = extractImageFromBlock(block);
+        if (img && imgIndex < descs.length) {
+          const desc = descs[imgIndex];
+          if (desc && desc !== UNAVAILABLE) {
+            withPersisted.push({
+              type: "text",
+              text: buildPersistedDescriptionBlock(imageHash(img.mimeType, img.data), desc),
+            });
+          }
+          imgIndex++;
+        }
+      }
+      return { content: withPersisted };
+    }
     if (stripped) return { content: next as (TextContent | ImageContent)[] };
   });
 
@@ -704,12 +738,43 @@ export default function (pi: ExtensionAPI) {
   // replaced them), so this is usually a no-op for the common paste-and-read
   // flow. For the images it does find, `loadDescription()` is a cache hit
   // (warmed by `before_agent_start`) or queues into the loader's current batch.
+  //
+  // PERSISTENCE (opt-in `persistDescriptions`): when the session was persisted
+  // on, a read tool result carries a `[Image described: <hash>]` marker +
+  // description block right next to the blob. On `/resume` (new process, empty
+  // in-memory cache) this hook matches the marker to the blob by hash, reuses
+  // the persisted description, drops the blob from the LLM-bound clone and
+  // strips the marker — NO vision call, no wait. Only images WITHOUT a
+  // persisted description fall through to `loadDescription()`.
   pi.on("context", async (event, ctx) => {
     if (!isConfigured(config)) return;
 
     const messages = event.messages as unknown as Array<Record<string, unknown>>;
     if (!Array.isArray(messages)) return;
 
+    // Persisted descriptions recovered from the session file (markers written
+    // by the read-tool `tool_result` handler when persistDescriptions was on).
+    // Matched by image hash; a UNAVAILABLE persisted body is ignored so a
+    // recorded failure still falls back to a fresh vision call (requirement:
+    // absent-or-failed persisted description → current behavior).
+    const persisted = new Map<string, string>();
+    for (const msg of messages) {
+      const content = msg.content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        const b = block as { type?: unknown; text?: unknown };
+        if (b.type !== "text" || typeof b.text !== "string") continue;
+        const parsed = parsePersistedDescriptionBlock(b.text);
+        if (parsed && parsed.description !== UNAVAILABLE && !persisted.has(parsed.hash)) {
+          persisted.set(parsed.hash, parsed.description);
+        }
+      }
+    }
+
+    // Collect image blocks NOT covered by a persisted description. Only these
+    // may need the vision model (cache hits resolve instantly; covered images
+    // never trigger a vision call — the resume fast-path).
     const byHash = new Map<string, ExtractedImage>();
     let anyImage = false;
     for (const msg of messages) {
@@ -719,30 +784,40 @@ export default function (pi: ExtensionAPI) {
         const img = extractImageFromBlock(block);
         if (!img) continue;
         anyImage = true;
-        byHash.set(imageHash(img.mimeType, img.data), img);
+        const hash = imageHash(img.mimeType, img.data);
+        if (!persisted.has(hash)) byHash.set(hash, img);
       }
     }
     if (!anyImage) return;
     if (!isHandoffTarget(ctx.model, config)) return;
     const loader = await getLoader();
     loader.bindTurnContext(ctx);
-    if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
-      notifyUnresolvedVisionModel(ctx, config.visionModel!);
-      return;
-    }
+
+    // Seed the in-memory cache with the persisted descriptions so a later
+    // re-read of the same image (same hash) in this resumed session is a
+    // cache hit too, not a re-describe.
+    for (const [hash, desc] of persisted) loader.seedDescription(hash, desc);
 
     // Cache hits (warmed by before_agent_start / tool_result) resolve
     // instantly; any remaining misses queue into the loader's current batch.
+    // An all-persisted payload skips this block entirely: no vision call,
+    // no wait.
     const imgs = [...byHash.values()];
-    const descArr = await Promise.all(imgs.map((img) => loader.loadDescription(img)));
     const descs = new Map<string, string>();
-    for (let i = 0; i < imgs.length; i++) {
-      descs.set(imageHash(imgs[i].mimeType, imgs[i].data), descArr[i]);
+    if (imgs.length > 0) {
+      if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
+        notifyUnresolvedVisionModel(ctx, config.visionModel!);
+        return;
+      }
+      const descArr = await Promise.all(imgs.map((img) => loader.loadDescription(img)));
+      if (ctx.signal?.aborted) return;
+
+      warnFailedImages(ctx, imgs, descArr, lastDescriberError ?? "unknown error");
+      for (let i = 0; i < imgs.length; i++) {
+        descs.set(imageHash(imgs[i].mimeType, imgs[i].data), descArr[i]);
+      }
     }
-
-    if (ctx.signal?.aborted) return;
-
-    warnFailedImages(ctx, imgs, descArr, lastDescriberError ?? "unknown error");
+    for (const [hash, desc] of persisted) descs.set(hash, desc);
 
     let changed = false;
     for (const msg of messages) {
@@ -753,10 +828,33 @@ export default function (pi: ExtensionAPI) {
       for (const block of content) {
         const img = extractImageFromBlock(block);
         if (img) {
-          next.push({ type: "text", text: descs.get(imageHash(img.mimeType, img.data)) ?? UNAVAILABLE });
-          touched = true;
+          const hash = imageHash(img.mimeType, img.data);
+          if (persisted.has(hash)) {
+            // Already described in this content: the persisted marker + text
+            // block is right there (marker stripped below) — drop the blob so
+            // the model receives the description exactly once.
+            touched = true;
+          } else {
+            next.push({ type: "text", text: descs.get(hash) ?? UNAVAILABLE });
+            touched = true;
+          }
         } else {
           next.push(block);
+        }
+      }
+      // Strip `[Image described: <hash>]` markers from persisted text blocks on
+      // the clone, so the model sees only the description itself.
+      for (let i = 0; i < next.length; i++) {
+        const block = next[i];
+        if (block && typeof block === "object" && (block as { type?: unknown }).type === "text") {
+          const text = (block as { text?: unknown }).text;
+          if (typeof text === "string") {
+            const stripped = stripPersistedMarker(text);
+            if (stripped !== text) {
+              next[i] = { type: "text", text: stripped };
+              touched = true;
+            }
+          }
         }
       }
       if (touched) {
@@ -784,7 +882,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("vision-handoff", {
     description: HANDOFF_COMMAND_DESCRIPTION,
     getArgumentCompletions(prefix: string) {
-      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "prewarm", "fallback", "aware", "add", "remove", "clear", "help"];
+      const subcommands = ["select", "model", "status", "enable", "disable", "auto", "thinking", "prewarm", "fallback", "aware", "persist", "add", "remove", "clear", "help"];
       const matches = subcommands.filter((s) => s.startsWith(prefix));
       return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
     },
@@ -824,6 +922,8 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
         "                               Inject pasted-image descriptions asynchronously when no matching read wins",
         "  /vision-handoff aware <on|off>",
         "                               Tell handoff targets they can read images via the read tool (opt-in, off by default)",
+        "  /vision-handoff persist <on|off>",
+        "                               Persist descriptions to the session file (resume reuses them, no new vision call)",
         "  /vision-handoff add <p/id>     Force handoff for an extra model",
         "  /vision-handoff remove <p/id>  Stop forcing handoff for a model",
         "  /vision-handoff clear          Clear the configured vision model",
@@ -888,6 +988,11 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
 
   if (subcommand === "aware") {
     handleAwareSubcommand(ctx, rest);
+    return;
+  }
+
+  if (subcommand === "persist") {
+    handlePersistSubcommand(ctx, rest);
     return;
   }
 
@@ -1091,6 +1196,35 @@ function handleAwareSubcommand(ctx: ExtensionCommandContext, rest: string): void
   );
 }
 
+/** Handle /vision-handoff persist <on|off> — toggle persisting descriptions
+ *  to the session file. When on, generated descriptions are written as
+ *  `[Image described: <hash>]` marker + text blocks in the read tool-result
+ *  content; on `/resume` the `context` hook reuses them by hash, skipping the
+ *  vision call entirely (no 30-40s re-describe latency). */
+function handlePersistSubcommand(ctx: ExtensionCommandContext, rest: string): void {
+  const value = rest.trim().toLowerCase();
+  if (!value) {
+    ctx.ui.notify(
+      `Persist descriptions to the session file: ${config.persistDescriptions ? "on" : "off"}.\n` +
+        "Usage: /vision-handoff persist <on|off>",
+      "info",
+    );
+    return;
+  }
+  if (value !== "on" && value !== "off") {
+    ctx.ui.notify("Usage: /vision-handoff persist <on|off>", "warning");
+    return;
+  }
+  const on = value === "on";
+  updateConfig(
+    ctx,
+    (c) => ({ ...c, persistDescriptions: on }),
+    on
+      ? "Persist descriptions on — generated descriptions are saved to the session file; resumed sessions reuse them without a new vision call."
+      : "Persist descriptions off — descriptions are generated per-session as before.",
+  );
+}
+
 async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify("/vision-handoff requires interactive mode.", "error");
@@ -1186,6 +1320,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
   lines.push(`Paste-time prewarm: ${config.prewarmPastedImages ? `on${editorInstalled ? "" : " (inactive — another custom editor is active)"}` : "off"}`);
   lines.push(`Async pasted-path fallback: ${config.asyncClipboardHandoff ? "on" : "off"}`);
   lines.push(`Aware prompt: ${config.awarePrompt ? "on" : "off"}`);
+  lines.push(`Persist descriptions (session file): ${config.persistDescriptions ? "on" : "off"}`);
   lines.push(`maxTokens: ${config.maxTokens ?? "unbounded"} · cacheMax: ${config.cacheMax} · maxDescriptionLines: ${config.maxDescriptionLines === 0 ? "unbounded" : config.maxDescriptionLines}`);
 
   const model = ctx.model;
