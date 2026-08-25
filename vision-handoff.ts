@@ -432,6 +432,23 @@ export default function (pi: ExtensionAPI) {
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
 
+    // Opt-in (`awarePrompt`): note telling text-only handoff targets they CAN
+    // read images via the read tool, since the handoff swaps image blocks for
+    // descriptions — some models otherwise refuse image-reading requests from
+    // self-knowledge even though the description is delivered as text. Must
+    // live in THIS single registration: only one before_agent_start result is
+    // used, and a second registration shadows this handler's fallback
+    // bootstrap (regression: the async pasted-path fallback never fired).
+    const awareSystemPrompt =
+      config.awarePrompt &&
+      config.visionModel &&
+      typeof event.systemPrompt === "string" &&
+      !event.systemPrompt.includes(AWARE_PROMPT_MARKER)
+        ? event.systemPrompt +
+          "\n\n" +
+          AWARE_PROMPT_NOTE.replace("{visionModel}", config.visionModel)
+        : undefined;
+
     // Fresh turn → fresh turn-abort controller. `before_agent_start` fires
     // BEFORE the agent run starts, so `ctx.signal` is undefined here (the run's
     // abort signal doesn't exist yet — it's created in `agent.prompt()` →
@@ -520,25 +537,10 @@ export default function (pi: ExtensionAPI) {
       // original fire-and-forget submit-time prewarm behavior.
       for (const prepared of preparedClipboardImages) prepared.catch(() => {});
     }
-  });
 
-  // Opt-in: tell text-only handoff targets they CAN read images via the
-  // read tool, since the handoff swaps image blocks for descriptions. Some
-  // models otherwise refuse image-reading requests from self-knowledge even
-  // though the description is delivered as text. Separate handler so it never
-  // interferes with the prewarm logic below.
-  pi.on("before_agent_start", async (event, ctx) => {
-    if (!isConfigured(config)) return;
-    if (!config.awarePrompt) return;
-    if (!isHandoffTarget(ctx.model, config)) return;
-    if (!config.visionModel) return;
-    if (event.systemPrompt.includes(AWARE_PROMPT_MARKER)) return;
-    return {
-      systemPrompt:
-        event.systemPrompt +
-        "\n\n" +
-        AWARE_PROMPT_NOTE.replace("{visionModel}", config.visionModel),
-    };
+    // Aware-prompt note (computed above): only the system prompt is overridden;
+    // the prewarm/fallback side effects above run either way.
+    return awareSystemPrompt !== undefined ? { systemPrompt: awareSystemPrompt } : undefined;
   });
 
   // A direct read and a nested pi.read both emit a read tool_call. If it targets
