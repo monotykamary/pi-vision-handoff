@@ -56,6 +56,5 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
-  },
-  "packageManager": "pnpm@11.20.0"
+  }
 }
