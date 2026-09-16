@@ -55,7 +55,9 @@ export class PrewarmEditor extends CustomEditor {
   private readonly modelRegistry: ModelRegistry;
 
   constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, deps: PrewarmEditorDeps) {
-    super(tui, theme, keybindings);
+    // Keep Pi's embedded working status: without this opt-in the streaming
+    // spinner falls back to the standalone row above the editor.
+    super(tui, theme, keybindings, { embedWorkingStatus: true });
     this.shouldPrewarm = deps.shouldPrewarm;
     this.prewarmPath = deps.prewarmPath;
     this.modelRegistry = deps.modelRegistry;
