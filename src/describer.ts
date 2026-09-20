@@ -26,16 +26,18 @@
  * abort listener.
  */
 
-import type {
-  Api,
-  AssistantMessage,
-  Context,
-  ImageContent,
-  Message,
-  Model,
-  SimpleStreamOptions,
-  TextContent,
-  ThinkingLevel,
+import {
+  normalizeContext,
+  type Api,
+  type AssistantMessage,
+  type Context,
+  type ImageContent,
+  type Message,
+  type Model,
+  type SimpleStreamOptions,
+  type TextContent,
+  type ThinkingLevel,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
@@ -170,11 +172,17 @@ export async function completeVisionModel(
   options: SimpleStreamOptions,
 ): Promise<AssistantMessage> {
   const isolatedOptions = isolateVisionRequest(model, options);
+  // pi 0.86 providers take a normalized `TranscriptContext` (the system prompt and
+  // tool declarations now live in transcript system messages). Fold the callers'
+  // legacy `{ systemPrompt, messages }` shorthand into a leading system message once
+  // here, then hand the same transcript to both the registered-provider stream and
+  // the compat `completeSimple` fallback (which also accepts a TranscriptContext).
+  const transcript: TranscriptContext = normalizeContext(context);
   const provider = modelRegistry.getRegisteredProviderConfig?.(model.provider);
   if (provider?.streamSimple && provider.api === model.api) {
-    return provider.streamSimple(model, context, isolatedOptions).result();
+    return provider.streamSimple(model, transcript, isolatedOptions).result();
   }
-  return completeSimple(model, context, isolatedOptions);
+  return completeSimple(model, transcript, isolatedOptions);
 }
 
 /** Dependencies the describer can't own itself (held by the engine). */
