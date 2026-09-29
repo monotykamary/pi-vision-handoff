@@ -218,44 +218,40 @@ export interface DescribeContext {
 export const describeAls = new AsyncLocalStorage<DescribeContext>();
 
 let fetchInterceptRefCount = 0;
-let savedRealFetch: typeof globalThis.fetch | null = null;
+let installation: { previous: typeof globalThis.fetch; wrapper: typeof globalThis.fetch; active: boolean } | undefined;
 
-/** Install the globalThis.fetch interceptor. Refcounted: the first caller
- *  patches fetch; later callers just bump the count. Idempotent per install. */
+/** Refcounted, ownership-safe interception. Each wrapper closes over its own
+ * predecessor: another extension may retain it after our session shuts down. */
 export function installFetchInterceptor(): void {
   if (fetchInterceptRefCount === 0) {
-    savedRealFetch = globalThis.fetch;
-    globalThis.fetch = interceptedFetch;
+    const current = { previous: globalThis.fetch, wrapper: globalThis.fetch, active: true };
+    current.wrapper = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const response = await current.previous(input, init);
+      const store = describeAls.getStore();
+      if (!current.active || !store || !response.body) return response;
+      const [bodyForSdk, bodyForEnergy] = response.body.tee();
+      store.energyReader = readEnergyFromTee(bodyForEnergy);
+      return new Response(bodyForSdk, {
+        headers: response.headers, status: response.status, statusText: response.statusText,
+      });
+    }) as typeof globalThis.fetch;
+    installation = current;
+    globalThis.fetch = current.wrapper;
   }
   fetchInterceptRefCount++;
 }
 
-/** Remove the interceptor. Refcounted: only the last caller restores fetch. */
 export function uninstallFetchInterceptor(): void {
   if (fetchInterceptRefCount > 0) fetchInterceptRefCount--;
-  if (fetchInterceptRefCount === 0 && savedRealFetch) {
-    globalThis.fetch = savedRealFetch;
-    savedRealFetch = null;
+  if (fetchInterceptRefCount === 0 && installation) {
+    installation.active = false;
+    // Never overwrite a wrapper installed by someone else after ours.
+    if (globalThis.fetch === installation.wrapper) globalThis.fetch = installation.previous;
+    installation = undefined;
   }
 }
 
-/** Current refcount — 0 means the interceptor is not installed. Test hook. */
+/** Current refcount — 0 means capture is inactive. Test hook. */
 export function fetchInterceptorRefcount(): number {
   return fetchInterceptRefCount;
-}
-
-async function interceptedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const real = savedRealFetch ?? globalThis.fetch;
-  const response = await real(input, init);
-  const store = describeAls.getStore();
-  // Outside a describer call (no ALS store) or for bodiless responses: pass
-  // through untouched.
-  if (!store || !response.body) return response;
-  const [bodyForSdk, bodyForEnergy] = response.body.tee();
-  store.energyReader = readEnergyFromTee(bodyForEnergy);
-  return new Response(bodyForSdk, {
-    headers: response.headers,
-    status: response.status,
-    statusText: response.statusText,
-  });
 }

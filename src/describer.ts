@@ -178,6 +178,11 @@ export async function completeVisionModel(
   // here, then hand the same transcript to both the registered-provider stream and
   // the compat `completeSimple` fallback (which also accepts a TranscriptContext).
   const transcript: TranscriptContext = normalizeContext(context);
+  // Pi 0.99's runtime owns native providers, auth, environment and request hooks.
+  // Calling a legacy provider config directly bypasses those contracts.
+  if (typeof modelRegistry.streamSimple === "function") {
+    return modelRegistry.streamSimple(model, transcript, isolatedOptions).result();
+  }
   const provider = modelRegistry.getRegisteredProviderConfig?.(model.provider);
   if (provider?.streamSimple && provider.api === model.api) {
     return provider.streamSimple(model, transcript, isolatedOptions).result();

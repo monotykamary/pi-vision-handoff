@@ -314,6 +314,23 @@ describe("fetch interceptor + AsyncLocalStorage routing", () => {
     expect(globalThis.fetch).toBe(myFetch);
   });
 
+  it("does not clobber later wrappers and retained predecessors never recurse after reinstall", async () => {
+    const base = vi.fn(async () => new Response("ok"));
+    globalThis.fetch = base as typeof fetch;
+    installFetchInterceptor();
+    const captured = globalThis.fetch;
+    const later = ((...args: Parameters<typeof fetch>) => captured(...args)) as typeof fetch;
+    globalThis.fetch = later;
+    uninstallFetchInterceptor();
+    expect(globalThis.fetch).toBe(later);
+    expect(await (await globalThis.fetch("https://test.invalid")).text()).toBe("ok");
+    installFetchInterceptor();
+    expect(await (await globalThis.fetch("https://test.invalid")).text()).toBe("ok");
+    uninstallFetchInterceptor();
+    expect(globalThis.fetch).toBe(later);
+    expect(base).toHaveBeenCalledTimes(2);
+  });
+
   it("tees the response body and stashes the reader on the active ALS store", async () => {
     const mockFetch = vi.fn(async () =>
       sseResponse([': energy {"energy_joules": 7.25}', ': cost {"request_cost_usd": 0.002}']),

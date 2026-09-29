@@ -16,6 +16,14 @@ _Describe images with a vision model you pick, then feed the text to models that
 
 ---
 
+## Pi 0.99 compatibility (0.10.7)
+
+Tested with Pi **0.99.0**. Host-provided Pi packages and TypeBox are peers (`*`), not bundled runtime dependencies; development uses exact Pi 0.99.0 pins and host-compatible TypeBox where needed.
+
+Vision calls use the native ModelRegistry streaming runtime (including native providers/auth/hooks). Fetch energy capture remains necessary for raw SSE comments, but cleanup now preserves later wrappers and retained predecessors cannot recurse after reinstall. Native nested read results are covered.
+
+Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity and reload checks. Set `PI99_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI99_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
+
 ## The Problem
 
 Some of the best coding models are blind. You paste a screenshot, a UI mock, a stack trace, or a diagram into pi — and a text-only model either silently ignores the image or rejects the request outright. Up to now your only options were to describe the image yourself, or switch to a (often weaker-for-coding) vision model just to read it.
