@@ -16,13 +16,13 @@ _Describe images with a vision model you pick, then feed the text to models that
 
 ---
 
-## Pi 0.99 compatibility (0.10.7)
+## Pi 1.0 compatibility (0.10.8)
 
-Tested with Pi **0.99.0**. Host-provided Pi packages and TypeBox are peers (`*`), not bundled runtime dependencies; development uses exact Pi 0.99.0 pins and host-compatible TypeBox where needed.
+Tested with Pi **1.0.0**. Host-provided Pi packages and TypeBox are peers (`*`), not bundled runtime dependencies; development uses exact Pi 1.0.0 pins and host-compatible TypeBox where needed.
 
 Vision calls use the native ModelRegistry streaming runtime (including native providers/auth/hooks). Fetch energy capture remains necessary for raw SSE comments, but cleanup now preserves later wrappers and retained predecessors cannot recurse after reinstall. Native nested read results are covered.
 
-Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity and reload checks. Set `PI99_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI99_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
+Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity and reload checks. Set `PI1_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI1_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
 
 ## The Problem
 
