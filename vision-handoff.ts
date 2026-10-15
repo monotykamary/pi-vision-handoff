@@ -431,7 +431,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    cancelAsyncClipboardHandoff();
+    // Since pi 1.2.0 this also fires for custom-message runs (continuations,
+    // our own async handoff). They carry no prompt or images, so they only get
+    // the per-run setup below and must not cancel a pending handoff or replace
+    // the user's turn prompt.
+    const userTurn =
+      event.messageType === "custom" ? undefined : { prompt: event.prompt || "", images: event.images ?? [] };
+    if (userTurn) cancelAsyncClipboardHandoff();
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
 
@@ -467,8 +473,9 @@ export default function (pi: ExtensionAPI) {
 
     // Capture this turn's user prompt so every image in the turn — attached or
     // read via the read tool — is described in the same request context.
-    loader.setPendingTurnPrompt(event.prompt || "");
+    if (userTurn) loader.setPendingTurnPrompt(userTurn.prompt);
     loader.bindTurnContext(ctx);
+    if (!userTurn) return awareSystemPrompt !== undefined ? { systemPrompt: awareSystemPrompt } : undefined;
 
     if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
       notifyUnresolvedVisionModel(ctx, config.visionModel!);
@@ -496,7 +503,7 @@ export default function (pi: ExtensionAPI) {
     // memoized, so all images in this frame (attached + clipboard-path)
     // coalesce into ONE batch dispatched via `setImmediate` after the
     // microtask cascade settles.
-    for (const image of event.images ?? []) {
+    for (const image of userTurn.images) {
       if (!image || image.type !== "image" || !image.data) continue;
       loader.loadDescription({ data: image.data, mimeType: image.mimeType || "image/png" }).catch(() => {});
     }
@@ -514,7 +521,7 @@ export default function (pi: ExtensionAPI) {
     // describes an image the agent will see). A file that can't be read, isn't
     // a supported image, or fails to resize is skipped (the agent's `read`
     // will still describe it via `tool_result` if it emits an image block).
-    const clipboardPaths = findPastedImagePaths(event.prompt || "");
+    const clipboardPaths = findPastedImagePaths(userTurn.prompt);
     const resizeImage = await loadResizeImage();
     const preparedClipboardImages = clipboardPaths.map(
       async (path): Promise<PreparedClipboardImage | null> => {
