@@ -22,7 +22,7 @@ Tested with Pi **1.0.0**. Host-provided Pi packages and TypeBox are peers (`*`),
 
 Vision calls use the native ModelRegistry streaming runtime (including native providers/auth/hooks). Fetch energy capture remains necessary for raw SSE comments, but cleanup now preserves later wrappers and retained predecessors cannot recurse after reinstall. Native nested read results are covered.
 
-Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity and reload checks. Set `PI1_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI1_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
+Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity, normalized attachment persistence/resume and reload checks. To verify both load orders against a local Fabric checkout, install its dependencies and run `VISION_FABRIC_EXTENSION=/absolute/path/to/pi-fabric/src/extension-bootstrap.ts node scripts/fabric-attachments-host.mjs` (offline providers; real Pi input/message/context hooks). Set `PI1_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI1_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
 
 ## The Problem
 
@@ -36,12 +36,21 @@ The `pi-umans-provider` extension quietly solved this for GLM 5.1: a hardcoded "
 
 - **Pick any vision-capable model** from your registry via an interactive picker — OpenAI, Anthropic, Google, Ollama, or any custom provider pi knows about.
 - Your choice **persists** to `~/.pi/agent/extensions/pi-vision-handoff.json`.
-- For any model that doesn't declare image input (or any model you explicitly target), `pi-vision-handoff` describes the image with your chosen vision model and swaps the image block for its description text at the **`context`** event — which fires *before* pi-ai's `downgradeUnsupportedImages` can strip image blocks for non-vision models. This covers every image source: pasted/attached images, `read`-tool results, and custom extension-injected messages. (Read-tool images additionally keep the description + image in the stored `tool_result` for kitty inline rendering and `/resume`.)
+- For any model that doesn't declare image input (or any model you explicitly target), `pi-vision-handoff` describes the image with your chosen vision model and swaps the image block for its description text at the **`context`** event — which fires *before* pi-ai's `downgradeUnsupportedImages` can strip image blocks for non-vision models. This covers every image source: pasted/attached images, `read`-tool results, and custom extension-injected messages. (With `persistDescriptions` enabled, read results and user attachments both keep the description + original image in session storage for inline rendering and `/resume`.)
 - Works across all four image-block shapes pi uses — the three provider-transformed formats (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages) plus pi-ai's internal `{ type: "image", data, mimeType }` emitted by the `read` tool — detected by shape.
 - Descriptions are **cached per image hash** (LRU) and produced **one batched vision call per image set** (dataloader-style: a prompt describing N images does not spin up N describer calls), so the swap is instant by the time the request fires.
 
 No `settings.json` touched. No per-provider glue. Pick a describer once and every text-only model you own can suddenly see.
 
+## Eager user attachments (Pi + Fabric)
+
+Existing user `ImageContent` attachments reach a text-only model as descriptions on its **first request**, in one batch for the attachment set. Handoff waits until Pi has normalized the images; it does not prewarm raw `before_agent_start.images`, whose bytes may differ after host resizing.
+
+When Fabric eagerly attaches a recognized Pi clipboard temp file at interactive submit, it preserves its path as `[Attached image: <path>]`. Handoff skips these marked paths when scanning for submit-time prewarm and asynchronous fallback: the image is already in the user message, so no second file read, resize, or fallback steering message is needed. This works in either extension load order. Ordinary unmarked pasted temp paths retain the existing prewarm/read/fallback flow; arbitrary non-temp paths are not prewarmed by handoff.
+
+With `persistDescriptions` on, the `message_end` hook stores successful user-attachment descriptions alongside the original normalized image blocks. `context` removes images only from the request-local clone for handoff targets. A fresh resumed process reuses stored descriptions without a vision call; native vision targets keep their images untouched. Failed descriptions are not persisted or cached and can be retried.
+
+The opt-in **paste-time** editor prewarm happens before submit/Fabric ingestion, so it remains speculative and can still do work before host normalization. Leave it off (the default) to avoid that possible duplicate work.
 ## Features
 
 - **🎮 Interactive picker** — `/vision-handoff` opens a TUI listing every model, vision-capable ones first (👁), to choose your describer.
@@ -54,7 +63,7 @@ No `settings.json` touched. No per-provider glue. Pick a describer once and ever
 - **🚀 Paste-time prewarm (opt-in)** — `prewarmPastedImages` (off by default) wraps the editor so pasted clipboard images are described the *instant* their path lands in the prompt — before you hit enter — not at submit. The vision call starts concurrent with you typing your question. Tradeoff: the description is generated without your typed question as context (the question usually isn't entered yet at paste time), and a paste-then-abandon wastes one vision call. TUI only; inactive if another extension replaces the editor. Toggle with `/vision-handoff prewarm on`.
 - **🏁 Async pasted-path fallback (opt-in)** — `asyncClipboardHandoff` races the normal read path against asynchronous delivery. A direct `read` or nested Fabric `pi.read` of the pasted path cancels the fallback and uses the normal tool-result/context flow; otherwise the completed description is queued as a steering message. Its transcript row is collapsed to one line by default and expands with `Ctrl+O`. Toggle it in the picker with `Ctrl+A` or run `/vision-handoff fallback on`.
 - **🧠 Aware prompt (opt-in)** — `awarePrompt` (off by default) injects a system-prompt note on handoff targets telling the text-only model it CAN read images via the read tool (the handoff swaps image blocks for descriptions). Some models otherwise refuse image-reading requests from self-knowledge even though the description is delivered as text. Toggle with `/vision-handoff aware on`.
-- **💾 Session persistence (opt-in)** — `persistDescriptions` writes each generated description into the session file as a `[Image described: <hash>]` marker + text block next to the read-result blob (the blob stays for kitty rendering). On `/resume` — a new process with an empty in-memory cache — the `context` hook matches the marker to the blob by hash and reuses the persisted description, so a resumed session **never re-calls the vision model** for already-described images (no 30-40s re-describe on the first resumed "ciao"). The persisted description is also seeded into the session cache, so later re-reads of the same image hit too. Toggle with `/vision-handoff persist on`.
+- **💾 Session persistence (opt-in)** — `persistDescriptions` writes each generated description into the session file as a `[Image described: <hash>]` marker + text block next to the read-result or user-attachment blob (the blob stays for inline rendering). On `/resume` — a new process with an empty in-memory cache — the `context` hook matches the marker to the blob by hash and reuses the persisted description, so a resumed session **never re-calls the vision model** for already-described images (no 30-40s re-describe on the first resumed "ciao"). The persisted description is also seeded into the session cache, so later re-reads of the same image hit too. Toggle with `/vision-handoff persist on`.
 - **🛡️ Graceful degradation** — no API key? Describer unreachable? Aborted? The image is replaced with a clean `[Image: description unavailable]` placeholder instead of crashing your turn.
 - **📋 Error logging** — every describer failure and every `image description failed` warning is appended as a JSONL line to `~/.pi/agent/logs/pi-vision-handoff/errors.log`, so a warning like `image description failed — unknown error` is troubleshootable: the detailed reason (exception stack, `stopReason`, config snapshot) is captured at the describer's failure source even when the in-memory error string was already reset by the time the warning fired. Size-capped with a single `.1` backup.
 - **📊 Usage reporting** — every real describer call reports model + tokens (and Neuralwatt energy/cost when the vision model is a Neuralwatt model), via `pi.appendEntry` + a `vision-handoff:usage` event for live consumers.
@@ -112,7 +121,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `prewarmPastedImages` | `false` | **Opt-in paste-time prewarm.** When `true`, a custom editor wrapper describes pasted clipboard images the instant their temp-file path lands in the prompt (pre-submit), instead of at submit. Trades a bit of description quality (the description is generated without your typed question as context, since the question usually isn't entered yet at paste time) and a speculative vision call on paste-then-abandon, for earlier prewarm. TUI mode only; inactive if another extension has replaced the editor. |
 | `asyncClipboardHandoff` | `false` | **Opt-in async fallback.** Starts from the existing submit-time prewarm. A matching direct `read` or Fabric-nested `pi.read` cancels message delivery; if no matching read wins, the description is queued asynchronously as a collapsed custom message and triggers/continues the agent turn. |
 | `awarePrompt` | `false` | **Opt-in aware prompt.** When `true`, injects a system-prompt note on handoff targets telling the text-only model it CAN read images via the read tool (the handoff swaps image blocks for descriptions). Some models otherwise refuse image-reading requests from self-knowledge. |
-| `persistDescriptions` | `false` | **Opt-in session persistence.** When `true`, every generated description is written into the session file as a `[Image described: <hash>]` marker + description text block in the read tool-result content, next to the blob (which stays for kitty rendering). On `/resume`, the `context` hook matches the marker to the blob by hash and reuses the persisted description — no vision call, no wait. Only real descriptions are persisted (a failed `[Image: description unavailable]` is not replayed; the next turn re-attempts). |
+| `persistDescriptions` | `false` | **Opt-in session persistence.** When `true`, every generated description is written into the session file as a `[Image described: <hash>]` marker + description text block in read tool-result or user-message content, next to the blob (which stays for inline rendering). On `/resume`, the `context` hook matches the marker to the blob by hash and reuses the persisted description — no vision call, no wait. Only real descriptions are persisted (a failed `[Image: description unavailable]` is not replayed; the next turn re-attempts). |
 | `maxTokens` | _(unset = model max, clamped to context window)_ | Cap on a single description's output. `null`/unset = use the vision model's declared max output (`model.maxTokens`), clamped so `maxTokens + 8192 <= contextWindow` (a model whose declared max equals its full context window would otherwise be rejected with a 400). Set a number only to cap cost/latency. A truncation is always surfaced via a `[... description truncated …]` marker when the model hits the limit, so a cut-off description is never mistaken for complete. |
 | `cacheMax` | `50` | Max described images kept in the in-memory cache per session. |
 | `maxDescriptionLines` | `0` | Cap on description lines (`0` = unbounded). Default keeps the full description so the `read` tool's native collapse (`ctrl+o`) handles compactness and the model gets complete context; setting `> 0` applies a lossy head-cap to both the TUI render and the model. |
@@ -202,10 +211,8 @@ The default submit-time pipeline below runs regardless:
     → before_agent_start
         • captures this turn's user prompt (shared by every image description)
         • binds turn context (vision model + abort signal) to the loader
-        • PRE-WARMS at paste-enter via the loader, two sources coalescing into
-          ONE batch:
-          1. attached image blocks (event.images) — vision-capable targets
-          2. pasted image FILE PATHS in the prompt text — the common non-vision
+        • PRE-WARMS unmarked pasted paths at paste-enter via the loader:
+          • unmarked pasted image FILE PATHS in the prompt text — the legacy non-vision
              flow: pi-clipboard, localterm-paste, and other paste mechanisms
              write each pasted image to a temp file and insert the PATH as text
              at the cursor, so on a non-vision model they arrive as path tokens
@@ -216,7 +223,11 @@ The default submit-time pipeline below runs regardless:
              one vision call), and `loadDescription()`s them — so the vision
              call starts the INSTANT you press enter, concurrent with the
              agent's first response, not waiting for it to `read` the files
-    → read tool / tool_result   (PRIMARY injection point)
+    → user message_end (persistDescriptions only)
+        • after host normalization, batch-describe user attachments
+        • store successful descriptions beside the original images
+        • context reuses these descriptions on the first request and on resume
+    → read tool / tool_result   (PRIMARY read injection point)
         • pi runs `read` calls in parallel (Promise.all); each read's
           tool_result handler calls `loadDescription(img)` for its image
           blocks and AWAITS the shared batch
@@ -252,7 +263,7 @@ The default submit-time pipeline below runs regardless:
           verbatim (blob dropped from the clone, marker stripped) and seeded
           into the session cache for later re-reads
 
-Because the describer runs during the **tool-result phase** (before the agent's next turn), not during the `context` transform (the critical path right before the LLM call), the agent gets described text immediately when its turn starts — it never waits on the describer inline.
+Read-result descriptions run during the **tool-result phase**, before the next model request. Direct user attachments instead wait for host normalization, then are described in `message_end` when persistence is enabled, or in `context` otherwise. Their first request waits for the description, so a text-only model can see the image immediately without first calling `read`.
 
 ### Batching: the DataLoader
 

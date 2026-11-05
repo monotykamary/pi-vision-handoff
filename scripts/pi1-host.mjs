@@ -6,6 +6,7 @@ import { findPackageJSON } from 'node:module';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { png } from './fixtures/png.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
 const scratch = resolve(process.env.PI1_SCRATCH ?? join(repo, '.tmp'));
@@ -35,8 +36,11 @@ test('1.5.0: load, declarations, native nested validation/results, refresh and s
   assert.equal(JSON.parse(readFileSync(join(sdk.getPackageDir(), 'package.json'), 'utf8')).version, "1.5.0");
   if (manifest.name === 'pi-namespace') writeFileSync(join(root, '.pi/namespace.json'), JSON.stringify({ builtinNamespace: 'fs', separator: '__' }));
   const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, defaultTools: ['+codemode'] });
-  const faux = fauxProvider({ provider: 'pi1-offline', api: 'pi1-offline-api', models: [{ id: 'test', name: 'Offline test', reasoning: false }], tokenSize: { min: 100, max: 100 } });
+  const faux = fauxProvider({ provider: 'pi1-offline', api: 'pi1-offline-api', models: [{ id: 'test', name: 'Offline test', reasoning: false, input: ['text'] }, { id: 'vision', name: 'Offline vision', reasoning: false, input: ['text', 'image'] }], tokenSize: { min: 100, max: 100 } });
   const modelRuntime = await sdk.ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: null, refreshOnCreate: false });
+  // The handoff intentionally requires a resolved API key; no real credential
+  // or network is needed by this deterministic provider.
+  faux.provider.auth.apiKey.resolve = async () => ({ auth: { apiKey: 'offline-test-key' } });
   modelRuntime.registerNativeProvider(faux.provider);
   await modelRuntime.refresh({ allowNetwork: false });
   const identityPath = join(root, 'identity.ts');
@@ -140,7 +144,59 @@ export default function () {
       assert.equal(session.getLastAssistantText(), 'continued');
       assert.equal(session.messages.filter(m => m.role === 'user').length, users);
     }
-    const image = { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jC1sAAAAASUVORK5CYII=' };
+    const image = { type: 'image', mimeType: 'image/png', data: png(1).toString('base64') };
+    // Actual host lifecycle: before_agent_start sees raw attachments;
+    // message_end sees normalized images and persists descriptions before
+    // context sends the first text-only request. No network/provider calls.
+    mkdirSync(join(agentDir, 'extensions'), { recursive: true });
+    writeFileSync(join(agentDir, 'extensions/pi-vision-handoff.json'), JSON.stringify({
+      enabled: true, visionModel: 'pi1-offline/vision', persistDescriptions: true,
+      asyncClipboardHandoff: true,
+    }));
+    await session.extensionRunner.emit({ type: 'session_start', reason: 'resume' });
+    const secondImage = { ...image, data: png(2).toString('base64') };
+    const beforeAttachment = faux.state.callCount;
+    faux.setResponses([
+      context => {
+        assert(context.messages.some(m => m.role === 'user' && m.content.some(c => c.type === 'image')));
+        assert.equal(context.messages.find(m => m.role === 'user').content.filter(c => c.type === 'image').length, 2, 'normalized attachment set shares one batch');
+        return fauxAssistantMessage('<<<IMAGE 1>>>\noffline attachment description one\n<<<END>>>\n<<<IMAGE 2>>>\noffline attachment description two\n<<<END>>>');
+      },
+      context => {
+        assert(!context.messages.some(m => Array.isArray(m.content) && m.content.some(c => c.type === 'image')));
+        assert.match(JSON.stringify(context.messages), /offline attachment description/);
+        return fauxAssistantMessage('attachment understood on first request');
+      },
+    ]);
+    await session.prompt('[Attached image: /tmp/pi-clipboard-offline.png]', { images: [image, secondImage] });
+    assert.equal(session.getLastAssistantText(), 'attachment understood on first request', JSON.stringify({ messages: session.messages.slice(-3), errors, calls: faux.state.callCount }));
+    assert.equal(faux.state.callCount, beforeAttachment + 2, 'exactly one describe plus the first main request');
+    const attached = session.messages.find(m => m.role === 'user' && Array.isArray(m.content) && m.content.some(c => c.type === 'image'));
+    assert(attached.content.some(c => c.type === 'text' && c.text.includes('[Image described:')));
+    assert(attached.content.some(c => c.type === 'image'), 'original image retained in agent state');
+    const persistedUser = session.sessionManager.getEntries().find(e => e.type === 'message' && e.message.role === 'user' && Array.isArray(e.message.content) && e.message.content.some(c => c.type === 'image'));
+    assert(persistedUser.message.content.some(c => c.type === 'text' && c.text.includes('[Image described:')), 'message_end replacement reaches session persistence');
+    // A new extension runtime (fresh loader/cache) consumes the persisted
+    // transcript, so this tests resume rather than an in-memory cache hit.
+    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'reload' });
+    const savedManager = session.sessionManager;
+    session.dispose();
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    ({ session } = await sdk.createAgentSession({ cwd: root, agentDir, modelRuntime, model: modelRuntime.getModel('pi1-offline', 'test'), resourceLoader: loader, settingsManager, sessionManager: savedManager }));
+    session.extensionRunner.onError(e => errors.push(e));
+    session.subscribe(e => { sessionEvents.push(e); });
+    await session.bindExtensions({});
+    const beforeResume = faux.state.callCount;
+    faux.setResponses([context => {
+      assert.match(JSON.stringify(context.messages), /offline attachment description/);
+      assert(!context.messages.some(m => Array.isArray(m.content) && m.content.some(c => c.type === 'image')));
+      return fauxAssistantMessage('resumed attachment');
+    }]);
+    await session.prompt('recall the attachment');
+    assert.equal(faux.state.callCount, beforeResume + 1, 'resume must not call the describer');
+    writeFileSync(join(agentDir, 'extensions/pi-vision-handoff.json'), JSON.stringify({ enabled: false }));
+    await session.extensionRunner.emit({ type: 'session_start', reason: 'resume' });
     const visionCalls = faux.state.callCount;
     faux.setResponses([(context, options) => {
       assert.equal(ai.getCurrentSystemPrompt(context.messages), 'Describe the offline image.');
@@ -151,7 +207,7 @@ export default function () {
       return fauxAssistantMessage('one white pixel');
     }]);
     const visionResult = await globalThis[Symbol.for('pi1.host.identity')].completeVisionModel(
-      session.model, new sdk.ModelRegistry(modelRuntime),
+      modelRuntime.getModel('pi1-offline', 'vision'), new sdk.ModelRegistry(modelRuntime),
       { systemPrompt: 'Describe the offline image.', messages: [{ role: 'user', content: [image], timestamp: Date.now() }] },
       { sessionId: 'main-session', headers: { 'x-nw-conversation-id': 'main-session', 'x-offline-probe': 'preserved' } });
     assert.equal(visionResult.stopReason, 'stop', JSON.stringify(visionResult));

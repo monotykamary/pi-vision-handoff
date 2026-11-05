@@ -301,7 +301,11 @@ const LEADING_WRAP_RE = new RegExp('^[^A-Za-z0-9_/@.~-]+');
 export function findPastedImagePaths(prompt: string): string[] {
   const tmp = tmpdir();
   const paths = new Set<string>();
-  for (const m of prompt.matchAll(PASTED_IMAGE_PATH_RE)) {
+  // Fabric replaces successfully ingested clipboard paths with this provenance
+  // marker. Those bytes already travel as user attachments: never read/resize
+  // them again or start the asynchronous pasted-path fallback for them.
+  const unattachedPrompt = prompt.replace(/\[Attached image: [^\]\r\n]+\]/g, "");
+  for (const m of unattachedPrompt.matchAll(PASTED_IMAGE_PATH_RE)) {
     const token = m[1];
     if (!token) continue;
     if (URL_RE.test(token)) continue;

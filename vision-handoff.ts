@@ -8,8 +8,8 @@
  * choice is persisted to ~/.pi/agent/extensions/pi-vision-handoff.json.
  *
  * Pipeline (provider-agnostic via @earendil-works/pi-ai's complete()):
- *   before_agent_start → warm the description cache for attached images AND
- *     pasted clipboard image file paths found in the prompt text (pre-warm at
+ *   before_agent_start → warm the description cache for unmarked pasted
+ *     clipboard image file paths found in the prompt text (pre-warm at
  *     paste-enter, concurrent with the agent's first response).
  *   optional async clipboard fallback → race matching read tool calls against a
  *     non-blocking steering-message injection; matching reads cancel delivery.
@@ -72,7 +72,7 @@ const AWARE_PROMPT_MARKER = "# Image reading (pi-vision-handoff active)";
  *  handoff swaps image blocks for descriptions. */
 const AWARE_PROMPT_NOTE = `# Image reading (pi-vision-handoff active)
 
-This model lacks native image input, but the pi-vision-handoff extension is enabled: when you call the read tool on an image file, a configured vision model ({visionModel}) describes it and the description is injected as text in the tool result. You CAN read and act on images via the read tool — do not refuse image-reading requests or claim you cannot see images. The "[Current model does not support images…]" note in tool output is stale and is stripped by the extension.`;
+This model lacks native image input, but pi-vision-handoff uses a configured vision model ({visionModel}) to provide image descriptions. For attached images, use the description already supplied in the conversation; do not reread the attached path just to obtain the same description. An "[Attached image: <path>]" marker records provenance, not proof that image content or a description is available. If the image was omitted or its description is unavailable, say so explicitly rather than inventing its contents. For new image files not already described, call the read tool: the handoff supplies their descriptions. You CAN read and act on images through this mechanism — do not refuse image-reading requests merely because this model lacks native vision. The "[Current model does not support images…]" note in tool output is stale and is stripped by the extension.`;
 
 /** Most recent describer failure message (auth error, network error, abort,
  *  empty response, etc.). Set by the describer via the loader deps; surfaced
@@ -436,7 +436,7 @@ export default function (pi: ExtensionAPI) {
     // the per-run setup below and must not cancel a pending handoff or replace
     // the user's turn prompt.
     const userTurn =
-      event.messageType === "custom" ? undefined : { prompt: event.prompt || "", images: event.images ?? [] };
+      event.messageType === "custom" ? undefined : { prompt: event.prompt || "" };
     if (userTurn) cancelAsyncClipboardHandoff();
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
@@ -482,31 +482,11 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // PRE-WARM at paste-enter via the DataLoader. Two image sources land here:
-    //
-    // 1. Attached image blocks (event.images) — vision-capable targets where
-    //    the user message itself carries image blocks (e.g. `pi --image`).
-    //
-    // 2. Pasted image FILE PATHS in the prompt text — the common non-vision
-    //    flow. pi's `handleClipboardImagePaste` (and other paste mechanisms like
-    //    localterm-paste) write each pasted image to a temp file and insert the
-    //    PATH as
-    //    text at the cursor; on a non-vision model these arrive as path tokens
-    //    in `event.prompt`, NOT as `event.images`. We scan the prompt for those
-    //    temp paths, read the files, and `loadDescription()` them so the ONE
-    //    batched vision call starts the instant you press enter — CONCURRENT
-    //    with the agent's first response generation — instead of waiting for
-    //    the agent to `read` the files. By the time the agent's `read` tool
-    //    results fire, `tool_result`'s `loadDescription()` is a cache hit.
-    //
-    // Both sources flow through the same loader: `load()` is synchronous and
-    // memoized, so all images in this frame (attached + clipboard-path)
-    // coalesce into ONE batch dispatched via `setImmediate` after the
-    // microtask cascade settles.
-    for (const image of userTurn.images) {
-      if (!image || image.type !== "image" || !image.data) continue;
-      loader.loadDescription({ data: image.data, mimeType: image.mimeType || "image/png" }).catch(() => {});
-    }
+    // Attached images are deliberately NOT prewarmed here. Pi normalizes
+    // prompt images AFTER before_agent_start (including model-specific resize
+    // profiles), so these bytes may not be the eventual cache keys. Describe
+    // only normalized message images in message_end (persistence opt-in) or
+    // context. This also makes Fabric/handoff extension ordering irrelevant.
 
     // Pasted clipboard image paths in the prompt text — resolve each to the
     // SAME ExtractedImage pi's `read` tool will emit, then warm the loader so
@@ -522,13 +502,13 @@ export default function (pi: ExtensionAPI) {
     // a supported image, or fails to resize is skipped (the agent's `read`
     // will still describe it via `tool_result` if it emits an image block).
     const clipboardPaths = findPastedImagePaths(userTurn.prompt);
-    const resizeImage = await loadResizeImage();
+    const resizeImage = clipboardPaths.length > 0 ? await loadResizeImage() : undefined;
     const preparedClipboardImages = clipboardPaths.map(
       async (path): Promise<PreparedClipboardImage | null> => {
         try {
           const read = readImageBuffer(path);
           if (!read) return null;
-          const image = await resolvePrewarmImage(read.buf, read.mimeType, resizeImage);
+          const image = await resolvePrewarmImage(read.buf, read.mimeType, resizeImage!);
           if (!image) return null;
           const description = loader.loadDescription(image);
           description.catch(() => {});
@@ -731,6 +711,45 @@ export default function (pi: ExtensionAPI) {
       return { content: withPersisted };
     }
     if (stripped) return { content: next as (TextContent | ImageContent)[] };
+  });
+
+  // Pi emits user message_end after prompt image normalization, before
+  // persisting the finalized message and before the first context transform.
+  // Keep the original images in storage and add only successful descriptions.
+  pi.on("message_end", async (event, ctx) => {
+    const message = event.message;
+    if (!config.persistDescriptions || !isConfigured(config) ||
+        !isHandoffTarget(ctx.model, config) || message.role !== "user" ||
+        !Array.isArray(message.content)) return;
+    const images = message.content.map(extractImageFromBlock).filter(
+      (image): image is ExtractedImage => image !== null,
+    );
+    if (images.length === 0) return;
+    const persisted = new Map<string, string>();
+    for (const block of message.content) {
+      if (block.type !== "text") continue;
+      const parsed = parsePersistedDescriptionBlock(block.text);
+      if (parsed && parsed.description !== UNAVAILABLE) persisted.set(parsed.hash, parsed.description);
+    }
+    const loader = await getLoader();
+    loader.bindTurnContext(ctx);
+    for (const [hash, description] of persisted) loader.seedDescription(hash, description);
+    if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) return;
+    const descriptions = await Promise.all(images.map((image) => {
+      const hash = imageHash(image.mimeType, image.data);
+      return persisted.has(hash) ? Promise.resolve(persisted.get(hash)!) : loader.loadDescription(image);
+    }));
+    if (ctx.signal?.aborted) return;
+    warnFailedImages(ctx, images, descriptions, lastDescriberError ?? "unknown error");
+    const content = message.content.slice();
+    for (let i = 0; i < images.length; i++) {
+      const hash = imageHash(images[i].mimeType, images[i].data);
+      const description = descriptions[i];
+      if (!description || description === UNAVAILABLE || persisted.has(hash)) continue;
+      persisted.set(hash, description);
+      content.push({ type: "text", text: buildPersistedDescriptionBlock(hash, description) });
+    }
+    if (content.length !== message.content.length) return { message: { ...message, content } };
   });
 
   // The FALLBACK injection point: the `context` event fires as the agent's

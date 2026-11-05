@@ -44,9 +44,17 @@ vi.mock("../../src/index.js", async (importActual) => {
   };
 });
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+vi.mock("../../src/image.js", async (importActual) => {
+  const actual = await importActual<typeof import("../../src/image.js")>();
+  return { ...actual, readImageBuffer: vi.fn(actual.readImageBuffer), resolvePrewarmImage: vi.fn(actual.resolvePrewarmImage) };
+});
+
 import factory from "../../vision-handoff.js";
 import { UNAVAILABLE } from "../../src/dataloader.js";
-import { imageHash } from "../../src/image.js";
+import { imageHash, findPastedImagePaths, readImageBuffer, resolvePrewarmImage } from "../../src/image.js";
 import { buildPersistedDescriptionBlock } from "../../src/index.js";
 
 interface CapturedPi {
@@ -117,6 +125,126 @@ const persistedBlock = (data: string, description: string) => ({
 const startSession = async (handlers: Record<string, (event: any, ctx: any) => Promise<unknown>>) => {
   await handlers["session_start"]({ type: "session_start", reason: "startup" }, sessionCtx());
 };
+
+describe("eager user attachments", () => {
+  beforeEach(() => {
+    vi.mocked(readImageBuffer).mockClear();
+    vi.mocked(resolvePrewarmImage).mockClear();
+    runBatch.mockClear();
+    runBatch.mockImplementation(async (misses: { hash: string }[]) =>
+      new Map(misses.map(({ hash }) => [hash, `desc-for-${hash}`])));
+    configState.current.persistDescriptions = false;
+    configState.current.asyncClipboardHandoff = true;
+    configState.current.awarePrompt = false;
+  });
+
+  it("aware prompt prefers supplied attachment descriptions and treats markers as provenance", async () => {
+    configState.current.awarePrompt = true;
+    const { handlers } = setup();
+    await startSession(handlers);
+    const result = await handlers.before_agent_start({ prompt: "look", images: [], systemPrompt: "base" }, sessionCtx()) as any;
+    expect(result.systemPrompt).toContain("do not reread the attached path");
+    expect(result.systemPrompt).toContain("records provenance, not proof");
+    expect(result.systemPrompt).toContain("say so explicitly");
+    configState.current.awarePrompt = false;
+  });
+
+  it("skips only marked paths while preserving the unmarked temp-path flow", () => {
+    const attached = join(tmpdir(), "pi-clipboard-attached.png");
+    const legacy = join(tmpdir(), "localterm-paste-legacy.png");
+    expect(findPastedImagePaths(`[Attached image: ${attached}] ${legacy}`)).toEqual([legacy]);
+    expect(findPastedImagePaths(`[Attached image: ${attached}] ${attached}`)).toEqual([attached]);
+  });
+
+  // Input hooks finish before ANY before_agent_start hook, independent of
+  // extension load order. Simulate Fabric's completed transform in both orders.
+  for (const order of ["fabric-first", "handoff-first"]) {
+    for (const normalized of ["RAW", "NORMALIZED"]) {
+      it(`${order}: ${normalized} bytes reach the first request once, without path fallback`, async () => {
+        const { handlers, pi } = setup();
+        await startSession(handlers);
+        const data = `${order}-${normalized}`;
+        const input = { prompt: `inspect [Attached image: ${join(tmpdir(), "pi-clipboard-eager.png")}]`, images: [imageContent(`${order}-RAW`)] };
+        await handlers.before_agent_start({ messageType: "user", ...input }, sessionCtx());
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(runBatch).not.toHaveBeenCalled();
+        expect(readImageBuffer).not.toHaveBeenCalled();
+        expect(resolvePrewarmImage).not.toHaveBeenCalled();
+        const stored = { role: "user", content: [{ type: "text", text: input.prompt }, imageContent(data)] };
+        const result = await handlers.context({ messages: structuredClone([stored]) }, ctxWithSignal()) as any;
+        expect(runBatch).toHaveBeenCalledTimes(1);
+        expect(runBatch.mock.calls[0][0]).toEqual([expect.objectContaining({ hash: hashOf(data) })]);
+        expect(JSON.stringify(result.messages)).toContain(`desc-for-${hashOf(data)}`);
+        expect(result.messages[0].content.some((b: any) => b.type === "image")).toBe(false);
+        expect(stored.content[1]).toEqual(imageContent(data));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(pi.sendMessage).not.toHaveBeenCalled();
+      });
+    }
+  }
+
+  it("batches all existing user ImageContent attachments on the first request", async () => {
+    const { handlers } = setup();
+    await startSession(handlers);
+    await handlers.before_agent_start({ prompt: "compare", images: [imageContent("BATCH-A"), imageContent("BATCH-B")] }, sessionCtx());
+    expect(runBatch).not.toHaveBeenCalled();
+    await handlers.context({ messages: [{ role: "user", content: [imageContent("BATCH-A"), imageContent("BATCH-B")] }] }, ctxWithSignal());
+    expect(runBatch).toHaveBeenCalledTimes(1);
+    expect(runBatch.mock.calls[0][0]).toHaveLength(2);
+  });
+
+  it("persists normalized user attachments without replacing images; resume needs no describer", async () => {
+    configState.current.persistDescriptions = true;
+    const { handlers } = setup();
+    await startSession(handlers);
+    const original = { role: "user", timestamp: 123, content: [imageContent("USER-PERSIST-A"), imageContent("USER-PERSIST-B")] };
+    const result = await handlers.message_end({ message: original }, ctxWithSignal()) as any;
+    expect(result.message.timestamp).toBe(123);
+    expect(result.message.content.slice(0, 2)).toEqual(original.content);
+    expect(original.content).toHaveLength(2);
+    expect(runBatch).toHaveBeenCalledTimes(1);
+    expect(runBatch.mock.calls[0][0]).toHaveLength(2);
+    // A fresh module instance has an empty loader cache, just as on /resume.
+    vi.resetModules();
+    const freshFactory = (await import("../../vision-handoff.js")).default;
+    const resumed = setup();
+    freshFactory(resumed.pi as any);
+    await startSession(resumed.handlers);
+    runBatch.mockClear();
+    const context = await resumed.handlers.context({ messages: structuredClone([result.message]) }, ctxWithSignal()) as any;
+    expect(runBatch).not.toHaveBeenCalled();
+    expect(context.messages[0].content.filter((b: any) => b.type === "image")).toHaveLength(0);
+    expect(context.messages[0].content.filter((b: any) => b.text?.startsWith("[Image: desc-for-"))).toHaveLength(2);
+    expect(JSON.stringify(context)).not.toContain("[Image described:");
+  });
+
+  it("leaves native vision attachments untouched, including stored originals", async () => {
+    configState.current.persistDescriptions = true;
+    const { handlers } = setup();
+    await startSession(handlers);
+    const ctx = { ...ctxWithSignal(), model: { provider: "native", id: "vision", input: ["text", "image"] } };
+    const message = { role: "user", content: [imageContent("NATIVE")] };
+    expect(await handlers.message_end({ message }, ctx)).toBeUndefined();
+    expect(await handlers.context({ messages: [message] }, ctx)).toBeUndefined();
+    expect(message.content).toEqual([imageContent("NATIVE")]);
+    expect(runBatch).not.toHaveBeenCalled();
+  });
+
+  it("does not persist failed user descriptions, and retries on a later request", async () => {
+    configState.current.persistDescriptions = true;
+    const { handlers } = setup();
+    await startSession(handlers);
+    runBatch.mockImplementation(async () => new Map());
+    const message = { role: "user", content: [imageContent("USER-RETRY")] };
+    expect(await handlers.message_end({ message }, ctxWithSignal())).toBeUndefined();
+    const failedCalls = runBatch.mock.calls.length;
+    runBatch.mockImplementation(async (misses: { hash: string }[]) => new Map(misses.map(({ hash }) => [hash, "recovered"])));
+    const result = await handlers.context({ messages: structuredClone([message]) }, ctxWithSignal()) as any;
+    expect(runBatch.mock.calls.length).toBeGreaterThan(failedCalls);
+    expect(JSON.stringify(result)).toContain("[Image: recovered]");
+    expect(message.content).toEqual([imageContent("USER-RETRY")]);
+  });
+});
 
 describe("persistDescriptions — session-file persistence", () => {
   beforeEach(() => {
