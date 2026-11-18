@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmdirSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -153,6 +156,29 @@ describe("rotateLogIfNeeded", () => {
     expect(existsSync(path)).toBe(false);
     expect(existsSync(backup)).toBe(true);
     expect(readFileSync(backup, "utf8")).toBe("x".repeat(cap));
+  });
+
+  it("does not rotate or append around another process's active log lock", () => {
+    const path = getErrorLogPath();
+    const lock = path + ".lock";
+    const oldLog = "x".repeat(MAX_LOG_BYTES);
+    writeFileSync(path, oldLog);
+    chmodSync(path, 0o640);
+    mkdirSync(lock);
+    const oldDate = new Date(0);
+    utimesSync(lock, oldDate, oldDate);
+    const entry = { phase: "batch" as const, reason: "after release", visionModel: null, imageHashes: [], imageCount: 0 };
+    rotateLogIfNeeded(path);
+    appendVisionError(entry);
+    expect(statSync(path).size).toBe(MAX_LOG_BYTES);
+    expect(existsSync(path + ".1")).toBe(false);
+    expect(existsSync(lock)).toBe(true);
+    rmdirSync(lock);
+
+    appendVisionError(entry);
+    expect(readFileSync(path + ".1", "utf8")).toBe(oldLog);
+    expect(JSON.parse(readFileSync(path, "utf8")).reason).toBe("after release");
+    expect(statSync(path).mode & 0o777).toBe(0o640);
   });
 
   it("appendVisionError rotates before writing once the active log exceeds the cap", () => {

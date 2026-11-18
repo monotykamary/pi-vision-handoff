@@ -6,9 +6,10 @@
  */
 
 import type { ImageContent, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { resolveAgentDir } from "./agent-dir.js";
+import { isFsError, replaceFile, resolveWritableTarget, withFileLock } from "./shared-file.js";
 
 export * from "./usage.js";
 
@@ -311,25 +312,56 @@ export function normalizeConfig(raw: unknown): VisionHandoffConfig {
 
 /** Read config from disk (falls back to defaults on missing/corrupt file). */
 export function readConfig(): VisionHandoffConfig {
-  const path = getConfigPath();
-  if (!existsSync(path)) return { ...DEFAULT_CONFIG };
   try {
-    const raw = readFileSync(path, "utf8");
-    return normalizeConfig(JSON.parse(raw));
+    return normalizeConfig(readConfigObject(getConfigPath()));
   } catch {
     return { ...DEFAULT_CONFIG };
   }
 }
 
-/** Write config to disk. Creates the directory if needed. Returns the path written. */
-export function writeConfig(config: VisionHandoffConfig): string {
-  const path = getConfigPath();
-  const dir = join(resolveAgentDir(), CONFIG_SUBDIR);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+function readConfigObject(path: string): Record<string, unknown> {
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (error) {
+    if (isFsError(error, "ENOENT")) return {};
+    throw error;
   }
-  writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf8");
-  return path;
+  const raw: unknown = JSON.parse(content);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`Expected a config object in ${path}`);
+  }
+  return raw as Record<string, unknown>;
+}
+
+export type VisionConfigEdit = Partial<VisionHandoffConfig> |
+  ((latest: VisionHandoffConfig) => Partial<VisionHandoffConfig>);
+
+/** Merge only edited keys into the latest on-disk config under a process lock. */
+export function writeConfig(edit: VisionConfigEdit): { path: string; config: VisionHandoffConfig } {
+  const path = getConfigPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const target = resolveWritableTarget(path);
+  if (basename(target).toLowerCase() === "settings.json") {
+    throw new Error(`Refusing to overwrite Pi settings: ${target}`);
+  }
+  return withFileLock(target, 250, () => {
+    if (resolveWritableTarget(path) !== target) throw new Error(`Config target changed: ${path}`);
+    let mode: number | undefined;
+    try {
+      const info = statSync(target);
+      if (!info.isFile()) throw new Error(`Not a regular file: ${target}`);
+      mode = info.mode & 0o7777;
+    } catch (error) {
+      if (!isFsError(error, "ENOENT")) throw error;
+    }
+    // Unlike readConfig's startup fallback, a failed parse must abort a write.
+    const raw = readConfigObject(target);
+    const patch = typeof edit === "function" ? edit(normalizeConfig(raw)) : edit;
+    const merged = { ...raw, ...patch };
+    if (Object.keys(patch).length) replaceFile(target, JSON.stringify(merged, null, 2) + "\n", mode);
+    return { path, config: normalizeConfig(merged) };
+  });
 }
 
 export interface ExtractedImage {

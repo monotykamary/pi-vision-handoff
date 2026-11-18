@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import {
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
+  readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   DEFAULT_CONFIG,
@@ -326,7 +331,7 @@ describe("config round-trip via PI_CODING_AGENT_DIR", () => {
   });
 
   it("writes to ~/.pi-equivalent/extensions/pi-vision-handoff.json", () => {
-    const path = writeConfig({ ...DEFAULT_CONFIG, visionModel: "openai/gpt-4o" });
+    const { path } = writeConfig({ visionModel: "openai/gpt-4o" });
     expect(path).toBe(join(tmpHome, "extensions", "pi-vision-handoff.json"));
     expect(existsSync(path)).toBe(true);
 
@@ -357,6 +362,75 @@ describe("config round-trip via PI_CODING_AGENT_DIR", () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "pi-vision-handoff.json"), "{not json", "utf8");
     expect(readConfig()).toEqual(DEFAULT_CONFIG);
+  });
+
+  it("merges into the file published by the process which holds the config lock", async () => {
+    const { path } = writeConfig({ handoffModels: ["test/initial"] });
+    const child = spawn(process.execPath, ["-e", `
+      const fs = require('node:fs');
+      const path = process.argv[1];
+      const lock = path + '.lock';
+      fs.mkdirSync(lock);
+      const deadline = setTimeout(() => process.exit(2), 3000);
+      process.send('locked');
+      process.once('message', () => {
+        setTimeout(() => {
+          const temp = path + '.other.tmp';
+          fs.writeFileSync(temp, JSON.stringify({ handoffModels: ['test/other'], extra: 7 }), { flag: 'wx' });
+          fs.renameSync(temp, path);
+          fs.rmdirSync(lock);
+          clearTimeout(deadline);
+          process.disconnect();
+        }, 25);
+      });
+    `, path], { stdio: ["ignore", "ignore", "inherit", "ipc"] });
+    const exited = once(child, "exit");
+    await once(child, "message");
+    child.send("publish");
+    try {
+      const { config: saved } = writeConfig((latest) => ({
+        handoffModels: [...latest.handoffModels, "test/mine"],
+      }));
+      expect(saved.handoffModels).toEqual(["test/other", "test/mine"]);
+      expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ handoffModels: saved.handoffModels, extra: 7 });
+    } finally {
+      expect(await exited).toEqual([0, null]);
+    }
+  });
+
+  it("preserves the mode and the symlink while applying an independent patch", () => {
+    const path = getConfigPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const target = join(tmpHome, "custom.json");
+    writeFileSync(target, '{"thinkingLevel":"max","unknown":42}');
+    chmodSync(target, 0o640);
+    symlinkSync(target, path);
+
+    const { config: saved } = writeConfig({ visionModel: "test/model" });
+    expect(saved.thinkingLevel).toBe("max");
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+    expect(statSync(target).mode & 0o777).toBe(0o640);
+    expect(JSON.parse(readFileSync(target, "utf8"))).toEqual({
+      thinkingLevel: "max", unknown: 42, visionModel: "test/model",
+    });
+  });
+
+  it("does not overwrite malformed config or write into Pi settings through an alias", () => {
+    const path = getConfigPath();
+    mkdirSync(dirname(path), { recursive: true });
+    for (const malformed of ["{broken", "[]", "null"]) {
+      writeFileSync(path, malformed);
+      expect(() => writeConfig({ enabled: false })).toThrow();
+      expect(readFileSync(path, "utf8")).toBe(malformed);
+    }
+    unlinkSync(path);
+    const piSettings = join(tmpHome, "settings.json");
+    const original = '{"packages":["example"]}\n';
+    writeFileSync(piSettings, original);
+    symlinkSync(piSettings, path);
+    expect(() => writeConfig({ enabled: false })).toThrow(/Refusing to overwrite Pi settings/);
+    expect(readFileSync(piSettings, "utf8")).toBe(original);
+    expect(readdirSync(dirname(path))).toEqual(["pi-vision-handoff.json"]);
   });
 
   it("getConfigPath points at extensions/pi-vision-handoff.json", () => {

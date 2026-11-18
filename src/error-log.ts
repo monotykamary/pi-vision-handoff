@@ -22,9 +22,10 @@
  * errors.log.1) bounds growth to ~2× the cap.
  */
 
-import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, closeSync, fchmodSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { resolveAgentDir } from "./agent-dir.js";
+import { isFsError, resolveWritableTarget, withFileLock } from "./shared-file.js";
 
 /** Subdirectory under the pi agent dir holding this extension's logs. */
 const LOG_SUBDIR = "logs/pi-vision-handoff";
@@ -95,19 +96,39 @@ export function formatErrorLogLine(entry: VisionErrorLogEntry): string {
  *  is cleared for a fresh log. Bounds total on-disk log to ~2× `maxSize`.
  *  No-op when the file doesn't exist or is under the cap. Never throws. */
 export function rotateLogIfNeeded(path: string = getErrorLogPath(), maxSize: number = MAX_LOG_BYTES): void {
-  let size: number;
   try {
-    size = statSync(path).size;
+    withLogLock(path, (target) => rotateLockedLog(target, maxSize));
   } catch {
-    return; // missing file — nothing to rotate
+    // Logging must not throw, including when another process owns the lock.
   }
-  if (size < maxSize) return;
+}
+
+function withLogLock<T>(path: string, action: (target: string) => T): T {
+  const target = resolveWritableTarget(path);
+  if (basename(target).toLowerCase() === "settings.json") throw new Error("Not an error log");
+  return withFileLock(target, 75, () => {
+    if (resolveWritableTarget(path) !== target) throw new Error("Log target changed");
+    return action(target);
+  });
+}
+
+/** Called only with the active log's lock held. Returns its old mode on rotation. */
+function rotateLockedLog(path: string, maxSize: number): number | undefined {
   try {
-    renameSync(path, path + ".1");
-  } catch {
-    // rename failed (permissions, etc.) — leave the file; it'll keep growing
-    // until the condition clears. Logging must not throw.
+    const info = statSync(path);
+    if (!info.isFile()) throw new Error("Not a regular log file");
+    if (info.size >= maxSize) {
+      try {
+        renameSync(path, path + ".1");
+        return info.mode & 0o7777;
+      } catch {
+        // If rotation fails, continue appending to the existing file.
+      }
+    }
+  } catch (error) {
+    if (!isFsError(error, "ENOENT")) throw error;
   }
+  return undefined;
 }
 
 /**
@@ -119,12 +140,23 @@ export function rotateLogIfNeeded(path: string = getErrorLogPath(), maxSize: num
  */
 export function appendVisionError(input: Omit<VisionErrorLogEntry, "timestamp">): void {
   try {
-    const dir = getErrorLogDir();
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const path = getErrorLogPath();
-    rotateLogIfNeeded(path);
+    mkdirSync(getErrorLogDir(), { recursive: true });
     const entry: VisionErrorLogEntry = { timestamp: new Date().toISOString(), ...input };
-    appendFileSync(path, formatErrorLogLine(entry), "utf8");
+    const line = formatErrorLogLine(entry);
+    withLogLock(getErrorLogPath(), (target) => {
+      const rotatedMode = rotateLockedLog(target, MAX_LOG_BYTES);
+      if (rotatedMode === undefined) {
+        appendFileSync(target, line, "utf8");
+      } else {
+        const fd = openSync(target, "wx", 0o600);
+        try {
+          fchmodSync(fd, rotatedMode);
+          writeFileSync(fd, line, "utf8");
+        } finally {
+          closeSync(fd);
+        }
+      }
+    });
   } catch {
     // never break the describer on a logging failure
   }

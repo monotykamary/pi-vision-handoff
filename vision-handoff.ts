@@ -49,6 +49,7 @@ import {
   HANDOFF_COMMAND_DESCRIPTION,
   UNAVAILABLE,
   type ExtractedImage,
+  type VisionConfigEdit,
   type VisionHandoffConfig,
 } from "./src/index.js";
 import {
@@ -973,12 +974,12 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
   }
 
   if (subcommand === "enable") {
-    updateConfig(ctx, (c) => ({ ...c, enabled: true }), "Vision handoff enabled.");
+    updateConfig(ctx, { enabled: true }, "Vision handoff enabled.");
     return;
   }
 
   if (subcommand === "disable") {
-    updateConfig(ctx, (c) => ({ ...c, enabled: false }), "Vision handoff disabled.");
+    updateConfig(ctx, { enabled: false }, "Vision handoff disabled.");
     return;
   }
 
@@ -991,7 +992,7 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
     const on = value === "on";
     updateConfig(
       ctx,
-      (c) => ({ ...c, autoHandoff: on }),
+      { autoHandoff: on },
       `Automatic handoff for non-vision models ${on ? "on" : "off"}.`,
     );
     return;
@@ -1025,7 +1026,7 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
   if (subcommand === "clear") {
     updateConfig(
       ctx,
-      (c) => ({ ...c, visionModel: null }),
+      { visionModel: null },
       "Vision model cleared — handoff inactive until you pick a model.",
     );
     return;
@@ -1047,7 +1048,7 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
       return;
     }
     const ref = formatModelRef(parsed.provider, parsed.id);
-    updateConfig(ctx, (c) => ({ ...c, visionModel: ref }), `Vision model set to ${ref}.`);
+    if (!updateConfig(ctx, { visionModel: ref }, `Vision model set to ${ref}.`)) return;
     if (!isVisionModel(model)) {
       ctx.ui.notify(
         `Note: ${ref} does not declare image input — it may not describe images well.`,
@@ -1070,7 +1071,7 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
     const ref = formatModelRef(parsed.provider, parsed.id);
     updateConfig(
       ctx,
-      (c) => ({ ...c, handoffModels: Array.from(new Set([...c.handoffModels, ref])) }),
+      (c) => ({ handoffModels: Array.from(new Set([...c.handoffModels, ref])) }),
       `Added ${ref} to handoff targets.`,
     );
     return;
@@ -1087,15 +1088,11 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
       return;
     }
     const ref = formatModelRef(parsed.provider, parsed.id);
-    const before = config.handoffModels.length;
     updateConfig(
       ctx,
-      (c) => ({ ...c, handoffModels: c.handoffModels.filter((m) => m !== ref) }),
+      (c) => ({ handoffModels: c.handoffModels.filter((m) => m !== ref) }),
       `Removed ${ref} from handoff targets.`,
     );
-    if (config.handoffModels.length === before) {
-      ctx.ui.notify(`Note: ${ref} was not in the handoff list.`, "info");
-    }
     return;
   }
 
@@ -1104,16 +1101,21 @@ async function handleHandoffCommand(ctx: ExtensionCommandContext, args: string):
 
 function updateConfig(
   ctx: ExtensionCommandContext,
-  transform: (c: VisionHandoffConfig) => VisionHandoffConfig,
-  message: string,
-): void {
-  const next = transform(config);
-  if (!next.asyncClipboardHandoff) cancelAsyncClipboardHandoff();
-  const path = writeConfig(next);
-  config = next;
-  visionModelCache = null;
-  visionModelUnresolvedRef = null;
-  ctx.ui.notify(`${message} (config: ${path})`, "info");
+  edit: VisionConfigEdit,
+  message: string | ((saved: VisionHandoffConfig) => string),
+): boolean {
+  try {
+    const saved = writeConfig(edit);
+    config = saved.config;
+    if (!config.asyncClipboardHandoff) cancelAsyncClipboardHandoff();
+    visionModelCache = null;
+    visionModelUnresolvedRef = null;
+    ctx.ui.notify(`${typeof message === "function" ? message(config) : message} (config: ${saved.path})`, "info");
+    return true;
+  } catch (error) {
+    ctx.ui.notify(`Failed to save vision handoff config: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return false;
+  }
 }
 
 /** Resolve a `/vision-handoff thinking <level>` argument into a
@@ -1130,7 +1132,7 @@ function handleThinkingSubcommand(ctx: ExtensionCommandContext, rest: string): v
     return;
   }
   if (arg === "off") {
-    updateConfig(ctx, (c) => ({ ...c, thinking: false }), "Vision describer thinking off.");
+    updateConfig(ctx, { thinking: false }, "Vision describer thinking off.");
     return;
   }
   if (!isThinkingLevel(arg)) {
@@ -1143,7 +1145,7 @@ function handleThinkingSubcommand(ctx: ExtensionCommandContext, rest: string): v
   const level = arg;
   updateConfig(
     ctx,
-    (c) => ({ ...c, thinking: true, thinkingLevel: level }),
+    { thinking: true, thinkingLevel: level },
     `Vision describer thinking on (${level}).`,
   );
 }
@@ -1169,7 +1171,7 @@ function handlePrewarmSubcommand(ctx: ExtensionCommandContext, rest: string): vo
       ? "Paste-time prewarm on — pasted images are described the instant their path lands in the prompt (before submit)."
       : "Paste-time prewarm on — but another custom editor extension is active, so it's unavailable. Submit-time prewarm still works; disable the other editor extension (or /vision-handoff prewarm off) to silence this."
     : "Paste-time prewarm off — images are described at submit time (default).";
-  updateConfig(ctx, (c) => ({ ...c, prewarmPastedImages: on }), note);
+  updateConfig(ctx, { prewarmPastedImages: on }, note);
 }
 
 /** Handle /vision-handoff fallback <on|off>. */
@@ -1190,7 +1192,7 @@ function handleFallbackSubcommand(ctx: ExtensionCommandContext, rest: string): v
   const on = value === "on";
   updateConfig(
     ctx,
-    (c) => ({ ...c, asyncClipboardHandoff: on }),
+    { asyncClipboardHandoff: on },
     on
       ? "Async pasted-path fallback on — a matching read wins the race; otherwise the description is injected as a collapsed message."
       : "Async pasted-path fallback off.",
@@ -1215,7 +1217,7 @@ function handleAwareSubcommand(ctx: ExtensionCommandContext, rest: string): void
   const on = value === "on";
   updateConfig(
     ctx,
-    (c) => ({ ...c, awarePrompt: on }),
+    { awarePrompt: on },
     on
       ? "Aware prompt on — handoff targets are told they can read images via the read tool."
       : "Aware prompt off.",
@@ -1244,7 +1246,7 @@ function handlePersistSubcommand(ctx: ExtensionCommandContext, rest: string): vo
   const on = value === "on";
   updateConfig(
     ctx,
-    (c) => ({ ...c, persistDescriptions: on }),
+    { persistDescriptions: on },
     on
       ? "Persist descriptions on — generated descriptions are saved to the session file; resumed sessions reuse them without a new vision call."
       : "Persist descriptions off — descriptions are generated per-session as before.",
@@ -1269,33 +1271,26 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
     const thinkingPick = await ctx.ui.select("Thinking", ["on", "off"]);
     if (thinkingPick === undefined) return;
     const thinking = thinkingPick === "on";
-    const thinkingLevel = config.thinkingLevel;
     const fallbackPick = await ctx.ui.select("Async pasted-path fallback", ["on", "off"]);
     if (fallbackPick === undefined) return;
     const asyncClipboardHandoff = fallbackPick === "on";
-    const thinkingNote = thinking
-      ? `thinking on (${thinkingLevel})${ref ? " \u2014 applies only if the vision model supports reasoning" : ""}`
-      : "thinking off";
-    updateConfig(
-      ctx,
-      (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel, asyncClipboardHandoff }),
-      ref ? `Vision model set to ${ref} \u00b7 ${thinkingNote}` : `Vision model cleared \u00b7 ${thinkingNote}`,
-    );
-    if (!ref) {
+    const saved = updateConfig(ctx, { visionModel: ref, thinking, asyncClipboardHandoff }, describeModelSelection);
+    if (saved && !ref) {
       ctx.ui.notify("Handoff is inactive until you pick a vision model.", "warning");
     }
     return;
   }
 
   const { VisionModelSelectorComponent } = await import("./src/vision-model-selector.js");
+  const initial = config;
   const result = await ctx.ui.custom<VisionModelSelectorResult>((tui, theme, _kb, done) => {
     const selector = new VisionModelSelectorComponent(
       theme,
       allModels,
-      config.visionModel,
-      config.thinking,
-      config.thinkingLevel,
-      config.asyncClipboardHandoff,
+      initial.visionModel,
+      initial.thinking,
+      initial.thinkingLevel,
+      initial.asyncClipboardHandoff,
       (r) => done(r),
     );
     return {
@@ -1317,23 +1312,23 @@ async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
     return;
   }
 
-  const ref = result.ref;
-  const thinking = result.thinking;
-  const thinkingLevel = result.thinkingLevel;
-  const asyncClipboardHandoff = result.asyncClipboardHandoff;
-  // Fold the thinking state into the single updateConfig notify so the
-  // "thinking off" message can't overwrite the model-change message.
-  const thinkingNote = thinking
-    ? `thinking on (${thinkingLevel})${ref ? " — applies only if the vision model supports reasoning" : ""}`
-    : "thinking off";
-  updateConfig(
-    ctx,
-    (c) => ({ ...c, visionModel: ref, thinking, thinkingLevel, asyncClipboardHandoff }),
-    ref ? `Vision model set to ${ref} · ${thinkingNote}` : `Vision model cleared · ${thinkingNote}`,
-  );
-  if (!ref) {
+  // The model is explicitly selected; the surrounding toggles are edits only
+  // if they changed during this picker interaction.
+  const patch: Partial<VisionHandoffConfig> = { visionModel: result.ref };
+  if (result.thinking !== initial.thinking) patch.thinking = result.thinking;
+  if (result.thinkingLevel !== initial.thinkingLevel) patch.thinkingLevel = result.thinkingLevel;
+  if (result.asyncClipboardHandoff !== initial.asyncClipboardHandoff) {
+    patch.asyncClipboardHandoff = result.asyncClipboardHandoff;
+  }
+  const saved = updateConfig(ctx, patch, describeModelSelection);
+  if (saved && !result.ref) {
     ctx.ui.notify("Handoff is inactive until you pick a vision model.", "warning");
   }
+}
+
+function describeModelSelection(saved: VisionHandoffConfig): string {
+  const thinking = saved.thinking ? `thinking on (${saved.thinkingLevel})${saved.visionModel ? " — applies only if the vision model supports reasoning" : ""}` : "thinking off";
+  return saved.visionModel ? `Vision model set to ${saved.visionModel} · ${thinking}` : `Vision model cleared · ${thinking}`;
 }
 
 function showStatus(ctx: ExtensionCommandContext): void {
