@@ -128,7 +128,7 @@ Created automatically at `~/.pi/agent/extensions/pi-vision-handoff.json` on firs
 | `prompt` | _(built-in)_ | Override the describer system prompt. |
 | `userPromptPrefix` | _(built-in)_ | Override the prefix prepended to your original prompt. |
 
-> The config path uses pi's `getAgentDir()` — set `PI_CODING_AGENT_DIR` to relocate it.
+> Set `PI_CODING_AGENT_DIR` to relocate the config. Commands merge only the fields they edit. They report a save error without replacing malformed config.
 
 ### Troubleshooting
 
@@ -142,7 +142,7 @@ When handoff fails, pi shows a short warning like `pi-vision-handoff: image desc
 
 **`reason: "unknown error"`** in a `warn` entry means the engine's shared last-error string was already reset (typically a concurrent batch cleared it) by the time the warning fired — so the real cause isn't in the warning. Correlate it with the matching `batch`/`single` entry: match on the `imageHashes` (and the timestamp) to recover the actual exception/`stopReason`. Deliberate user cancels (ESC) are not logged — they aren't errors.
 
-The log is append-only and size-capped (10 MB, rotating to `errors.log.1`), so a runaway broken vision model can't fill the disk; truncate it any time.
+The log is append-only and size-capped (10 MB, rotating to `errors.log.1`). A log entry may be skipped if another process holds the log lock for too long. If a crash leaves an empty `.lock` directory beside the config or the log, remove the lock only after confirming no process is writing that file.
 
 ## Installation
 
