@@ -238,15 +238,26 @@ const loaderDeps: LoaderDeps = {
   },
 };
 // The describer chain (dataloader -> describer -> pi-ai/compat) and pi-core's
-// resizeImage / pi-tui's Text each drag a host module graph into this
-// extension's loader when imported statically. Load them behind the first
-// image turn / editor install / async render so startup stays import-free.
+// resizeImage pull in separate host module graphs. Keep them cold until there
+// is an actual image, even on configured text-only turns.
 let loaderPromise: Promise<DescriptionLoader> | undefined;
-const getLoader = (): Promise<DescriptionLoader> => {
+let pendingLoaderTurn: {
+  context: Parameters<DescriptionLoader["bindTurnContext"]>[0];
+  prompt: string | undefined;
+} | undefined;
+const getLoader = async (): Promise<DescriptionLoader> => {
   loaderPromise ??= import("./src/dataloader.js").then(
     ({ DescriptionLoader }) => new DescriptionLoader(loaderDeps),
   );
-  return loaderPromise;
+  const loader = await loaderPromise;
+  if (pendingLoaderTurn) {
+    const { context, prompt } = pendingLoaderTurn;
+    pendingLoaderTurn = undefined;
+    loader.resetTurnAbort();
+    if (prompt !== undefined) loader.setPendingTurnPrompt(prompt);
+    loader.bindTurnContext(context);
+  }
+  return loader;
 };
 const loadResizeImage = () =>
   import("@earendil-works/pi-coding-agent").then(({ resizeImage }) => resizeImage);
@@ -426,8 +437,10 @@ export default function (pi: ExtensionAPI) {
     visionModelCache = null;
     visionModelUnresolvedRef = null;
     warnedHashes.clear();
-    void getLoader().then((loader) => loader.reset());
+    pendingLoaderTurn = undefined;
     currentModel = ctx.model;
+    // A new session only needs to reset a loader that was actually used.
+    if (loaderPromise) await loaderPromise.then((loader) => loader.reset());
     await installPrewarmEditor(ctx);
   });
 
@@ -438,7 +451,10 @@ export default function (pi: ExtensionAPI) {
     // the user's turn prompt.
     const userTurn =
       event.messageType === "custom" ? undefined : { prompt: event.prompt || "" };
-    if (userTurn) cancelAsyncClipboardHandoff();
+    if (userTurn) {
+      cancelAsyncClipboardHandoff();
+      pendingLoaderTurn = undefined;
+    }
     if (!isConfigured(config)) return;
     if (!isHandoffTarget(ctx.model, config)) return;
 
@@ -469,13 +485,15 @@ export default function (pi: ExtensionAPI) {
     // signal into it. Without this reset, a previous turn's ESC would leave
     // the controller aborted and every dispatch would short-circuit to
     // UNAVAILABLE.
-    const loader = await getLoader();
-    loader.resetTurnAbort();
-
-    // Capture this turn's user prompt so every image in the turn — attached or
-    // read via the read tool — is described in the same request context.
-    if (userTurn) loader.setPendingTurnPrompt(userTurn.prompt);
-    loader.bindTurnContext(ctx);
+    // Store the new turn's context without importing the engine. The first
+    // image read, paste or attachment applies it before any description work.
+    // Custom continuations retain the last user prompt just as an open loader
+    // would. If an engine already exists, reset it now so prewarm remains safe.
+    pendingLoaderTurn = {
+      context: { modelRegistry: ctx.modelRegistry, signal: ctx.signal },
+      prompt: userTurn?.prompt ?? pendingLoaderTurn?.prompt,
+    };
+    if (loaderPromise) await getLoader();
     if (!userTurn) return awareSystemPrompt !== undefined ? { systemPrompt: awareSystemPrompt } : undefined;
 
     if (!isAnyVisionModelResolvable(ctx.modelRegistry, config)) {
@@ -503,13 +521,14 @@ export default function (pi: ExtensionAPI) {
     // a supported image, or fails to resize is skipped (the agent's `read`
     // will still describe it via `tool_result` if it emits an image block).
     const clipboardPaths = findPastedImagePaths(userTurn.prompt);
-    const resizeImage = clipboardPaths.length > 0 ? await loadResizeImage() : undefined;
+    if (clipboardPaths.length === 0) return awareSystemPrompt !== undefined ? { systemPrompt: awareSystemPrompt } : undefined;
+    const [resizeImage, loader] = await Promise.all([loadResizeImage(), getLoader()]);
     const preparedClipboardImages = clipboardPaths.map(
       async (path): Promise<PreparedClipboardImage | null> => {
         try {
           const read = readImageBuffer(path);
           if (!read) return null;
-          const image = await resolvePrewarmImage(read.buf, read.mimeType, resizeImage!);
+          const image = await resolvePrewarmImage(read.buf, read.mimeType, resizeImage);
           if (!image) return null;
           const description = loader.loadDescription(image);
           description.catch(() => {});
@@ -520,7 +539,7 @@ export default function (pi: ExtensionAPI) {
       },
     );
 
-    if (config.asyncClipboardHandoff && clipboardPaths.length > 0) {
+    if (config.asyncClipboardHandoff) {
       scheduleAsyncClipboardInjection(pi, ctx, clipboardPaths, preparedClipboardImages);
     } else {
       // Start every preparation task even when no consumer awaits it. Each task
@@ -547,6 +566,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
+    pendingLoaderTurn = undefined;
     cancelAsyncClipboardHandoff();
   });
 
